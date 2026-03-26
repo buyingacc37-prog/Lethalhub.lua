@@ -313,7 +313,7 @@ local function instantClone()
         local cloneName = tostring(LocalPlayer.UserId) .. "_Clone"
         for _ = 1, 100 do
             if Workspace:FindFirstChild(cloneName) then break end
-            task.wait(0.1)
+            task.wait(1)
         end
 
         if not Workspace:FindFirstChild(cloneName) then
