@@ -305,10 +305,10 @@ local function instantClone()
             hum:EquipTool(cloner)
         end)
 
-        task.wait(0.4)
+        task.wait(1)
 
         cloner:Activate()
-        task.wait(0.4)
+        task.wait(1)
 
         local cloneName = tostring(LocalPlayer.UserId) .. "_Clone"
         for _ = 1, 100 do
