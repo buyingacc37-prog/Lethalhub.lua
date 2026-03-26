@@ -134,7 +134,7 @@ local DefaultConfig = {
         CarpetSpeedKey = "Q",
         InfiniteJump   = false,
     },
-    StealSpeed   = 20,
+    StealSpeed   = 25,
     ShowStealSpeedPanel = true,
     MenuKey      = "LeftControl",
     MobileGuiScale = 0.5,
@@ -156,31 +156,31 @@ local DefaultConfig = {
     HideAdminPanel = false,
     HideAutoSteal = false,
     CompactAutoSteal = false,
-    AutoKickOnSteal = false,
+    AutoKickOnSteal = true,
     InstantSteal = false,
     InvisStealAngle = 233,
     SinkSliderValue = 5,
     AutoRecoverLagback = true,
-    AutoInvisDuringSteal = false,
+    AutoInvisDuringSteal = true,
     InvisToggleKey = "I",
     ClickToAP = false,
     ClickToAPKeybind = "L",
     DisableClickToAPOnMoby = false,
     ProximityAP = false,
     ProximityAPKeybind = "P",
-    ProximityRange = 15,
+    ProximityRange = 25,
     StealSpeedKey = "C",
     ShowInvisPanel = true,
     ResetKey = "X",
-    AutoResetOnBalloon = false,
-    AntiBeeDisco = false,
+    AutoResetOnBalloon = true,
+    AntiBeeDisco = true,
     AutoDestroyTurrets = false,
     FOV = 70,
     SubspaceMineESP = false,
     AutoUnlockOnSteal = false,
     ShowUnlockButtonsHUD = false,
-    AutoTPOnFailedSteal = false,
-    AutoKickOnSteal = false,
+    AutoTPOnFailedSteal = true,
+    AutoKickOnSteal = true,
     AutoTPPriority = true,
     KickKey = "",
     CleanErrorGUIs = false,
@@ -305,10 +305,10 @@ local function instantClone()
             hum:EquipTool(cloner)
         end)
 
-        task.wait(0.05)
+        task.wait(0.1)
 
         cloner:Activate()
-        task.wait(0.05)
+        task.wait(0.1)
 
         local cloneName = tostring(LocalPlayer.UserId) .. "_Clone"
         for _ = 1, 100 do
