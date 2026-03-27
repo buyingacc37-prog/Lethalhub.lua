@@ -3920,7 +3920,7 @@ local function runAutoSnipe()
         instantClone()
         while _G.isCloning do task.wait() end
     end
-    task.wait(0.15)
+    task.wait(0.75)
 
     if carpet then hum:EquipTool(carpet) end
 
