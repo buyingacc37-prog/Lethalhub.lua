@@ -3865,7 +3865,7 @@ local function runAutoSnipe()
     local cloner = LocalPlayer.Backpack:FindFirstChild("Quantum Cloner") or char:FindFirstChild("Quantum Cloner")
 
     if carpet then hum:EquipTool(carpet) end
-    task.wait(0.01)
+    task.wait(1)
     local isSecondFloor = exactPos.Y > 10
     local plotIndex = getClosestBaseIdx(exactPos)
     local targetBasePos = isSecondFloor and BASES_HIGH[plotIndex] or BASES_LOW[plotIndex]
