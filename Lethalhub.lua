@@ -134,7 +134,7 @@ local DefaultConfig = {
         CarpetSpeedKey = "Q",
         InfiniteJump   = false,
     },
-    StealSpeed   = 25,
+    StealSpeed   = 20,
     ShowStealSpeedPanel = true,
     MenuKey      = "LeftControl",
     MobileGuiScale = 0.5,
@@ -156,31 +156,31 @@ local DefaultConfig = {
     HideAdminPanel = false,
     HideAutoSteal = false,
     CompactAutoSteal = false,
-    AutoKickOnSteal = true,
+    AutoKickOnSteal = false,
     InstantSteal = false,
     InvisStealAngle = 233,
     SinkSliderValue = 5,
     AutoRecoverLagback = true,
-    AutoInvisDuringSteal = true,
+    AutoInvisDuringSteal = false,
     InvisToggleKey = "I",
     ClickToAP = false,
     ClickToAPKeybind = "L",
     DisableClickToAPOnMoby = false,
     ProximityAP = false,
     ProximityAPKeybind = "P",
-    ProximityRange = 25,
+    ProximityRange = 15,
     StealSpeedKey = "C",
     ShowInvisPanel = true,
     ResetKey = "X",
-    AutoResetOnBalloon = true,
-    AntiBeeDisco = true,
+    AutoResetOnBalloon = false,
+    AntiBeeDisco = false,
     AutoDestroyTurrets = false,
-    FOV = 100,
+    FOV = 70,
     SubspaceMineESP = false,
     AutoUnlockOnSteal = false,
     ShowUnlockButtonsHUD = false,
-    AutoTPOnFailedSteal = true,
-    AutoKickOnSteal = true,
+    AutoTPOnFailedSteal = false,
+    AutoKickOnSteal = false,
     AutoTPPriority = true,
     KickKey = "",
     CleanErrorGUIs = false,
@@ -305,15 +305,15 @@ local function instantClone()
             hum:EquipTool(cloner)
         end)
 
-        task.wait(1)
+        task.wait(0.05)
 
         cloner:Activate()
-        task.wait(1)
+        task.wait(0.05)
 
         local cloneName = tostring(LocalPlayer.UserId) .. "_Clone"
         for _ = 1, 100 do
             if Workspace:FindFirstChild(cloneName) then break end
-            task.wait(1)
+            task.wait(0.1)
         end
 
         if not Workspace:FindFirstChild(cloneName) then
@@ -3865,7 +3865,7 @@ local function runAutoSnipe()
     local cloner = LocalPlayer.Backpack:FindFirstChild("Quantum Cloner") or char:FindFirstChild("Quantum Cloner")
 
     if carpet then hum:EquipTool(carpet) end
-    task.wait(1)
+    task.wait(0.01)
     local isSecondFloor = exactPos.Y > 10
     local plotIndex = getClosestBaseIdx(exactPos)
     local targetBasePos = isSecondFloor and BASES_HIGH[plotIndex] or BASES_LOW[plotIndex]
@@ -3920,7 +3920,7 @@ local function runAutoSnipe()
         instantClone()
         while _G.isCloning do task.wait() end
     end
-    task.wait(0.75)
+    task.wait(0.15)
 
     if carpet then hum:EquipTool(carpet) end
 
