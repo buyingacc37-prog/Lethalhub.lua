@@ -1,5 +1,54 @@
--- leaked by munckin discord.gg/3vUhgE7PAw
+-- =====================================================================
+-- EARLY BOOT -- runs DURING the loading screen, before game.Loaded.
+-- The main script still gates on game.Loaded below (17k lines assume a
+-- loaded game), but this thread overlaps the loading screen with the
+-- expensive prep the TP needs: the first require() of Synchronizer/Animals/
+-- etc. is the slowest part of the first pet scan, and those replicate while
+-- loading, so warm them now (WaitForChild yields until each streams in).
+-- TP-on-load then fires without paying that cost afterwards.
+--
+-- NOTE: a void-fall guard that anchored the HRP until game.Loaded used to
+-- live here. It was REMOVED -- game.Loaded fires once, so if loading finished
+-- during the character wait, its game.Loaded:Wait() hung forever and left the
+-- character PERMANENTLY ANCHORED (grapple fired but you never moved).
+-- =====================================================================
+do
+    task.spawn(function()
+        pcall(function()
+            local RS = game:GetService("ReplicatedStorage")
+            local pkgs = RS:WaitForChild("Packages", 120)
+            require(pkgs:WaitForChild("Synchronizer", 120))
+            local datas = RS:WaitForChild("Datas", 60)
+            require(datas:WaitForChild("Animals", 60))
+            require(datas:WaitForChild("Mutations", 30))
+            require(datas:WaitForChild("Traits", 30))
+            local utils = RS:WaitForChild("Utils", 30)
+            require(utils:WaitForChild("NumberUtils", 30))
+            pkgs:WaitForChild("Net", 30)   -- remote folder (alias resolver scans this)
+        end)
+    end)
+    -- Safety net: clear a stuck anchor (e.g. left over from the removed guard)
+    -- so re-executing the script always frees the character.
+    task.spawn(function()
+        local Players = game:GetService("Players")
+        local lp = Players.LocalPlayer
+        for _ = 1, 20 do
+            pcall(function()
+                local c = lp and lp.Character
+                local h = c and c:FindFirstChild("HumanoidRootPart")
+                if h and h.Anchored then h.Anchored = false end
+            end)
+            task.wait(0.25)
+        end
+    end)
+end
+
 if not game:IsLoaded() then game.Loaded:Wait() end
+
+-- LOAD TIMER (temporary): prints how long each phase of the hub's own execution
+-- takes from this point, so we can see where the load time actually goes.
+_G.__LT = os.clock()
+_G.__LMARK = function(name) print(("[LOAD] %-22s %6.2fs"):format(name, os.clock() - _G.__LT)) end
 
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -15,8 +64,530 @@ TeleportService = game:GetService("TeleportService")
 CoreGui = game:GetService("CoreGui")
 VirtualInputManager = game:GetService("VirtualInputManager")
 
--- Unlimited FPS: remove Roblox's default 240 FPS cap. 0 = uncapped on most executors.
-pcall(function() if setfpscap then setfpscap(0) end end)
+do
+-- Synchronizer channel-registry discovery (validated/scored version).
+-- The OLD version here did `_xchan = upval9[3] or upval9[1] or upval9` with NO
+-- validation, then cached it forever. When the game update shifted the upvalue
+-- layout it latched the WRONG table permanently, so every XenSyncGet returned
+-- nil and the scanner saw ZERO brainrots for the whole session. It also
+-- identified channels by a .Get method while sProp reads CacheTable, so the
+-- heuristic and the reader disagreed about what a channel even is.
+--
+-- This version SCORES every candidate table by how many entries carry a
+-- CacheTable and only latches on a non-zero score, so a wrong table can never
+-- stick. Probe order: Get upvalue 9 -> slot 3, then a bounded deep scan over
+-- every module function. Diagnostic in _G.XenSyncDiag.
+local _xchan
+local _lastTry, _attempts = 0, 0
+local _deepScans, _lastDeep = 0, 0
+local _mod
+
+local MAX_ATTEMPTS, RETRY_GAP = 40, 0.5
+local BOOT_T0, BOOT_BURST, BOOT_GAP = os.clock(), 3.0, 0.10
+local MAX_DEEP, DEEP_GAP = 3, 1.5
+
+local function _retryGap()
+    if (os.clock() - BOOT_T0) < BOOT_BURST then return BOOT_GAP end
+    return RETRY_GAP
+end
+
+-- A channel is a table with a CacheTable. Count them; the table holding the
+-- most is the registry.
+local function _channelCount(t)
+    if type(t) ~= "table" then return 0 end
+    local ok, hits = pcall(function()
+        local h, n = 0, 0
+        for _, v in next, t do
+            n = n + 1
+            if type(v) == "table" and type(rawget(v, "CacheTable")) == "table" then
+                h = h + 1
+            end
+            if n >= 200 then break end
+        end
+        return h
+    end)
+    return (ok and hits) or 0
+end
+
+local function _module()
+    if _mod then return _mod end
+    local ok, m = pcall(function()
+        return require(game:GetService("ReplicatedStorage").Packages.Synchronizer)
+    end)
+    if ok and type(m) == "table" then _mod = m; return _mod end
+    local ok2, m2 = pcall(function()
+        local pkgs = game:GetService("ReplicatedStorage"):FindFirstChild("Packages")
+        local sync = pkgs and pkgs:FindFirstChild("Synchronizer")
+        if not sync then return nil end
+        return require(sync)
+    end)
+    if ok2 and type(m2) == "table" then _mod = m2 end
+    return _mod
+end
+
+local function _probe(mod)
+    local gu = (debug and debug.getupvalue) or getupvalue
+    if type(gu) ~= "function" then return nil, 0, nil end
+    local best, bestN, where = nil, 0, nil
+    local function consider(t, tag)
+        local n = _channelCount(t)
+        if n > bestN then best, bestN, where = t, n, tag end
+    end
+    local ok, up = pcall(gu, mod.Get, 9)
+    if ok and type(up) == "table" then
+        consider(rawget(up, 3), "Get/9/3")
+        if bestN > 0 then return best, bestN, where end
+        consider(up, "Get/9")
+        if bestN > 0 then return best, bestN, where end
+    end
+    return nil, 0, nil
+end
+
+local function _deepScan(mod)
+    local gu = (debug and debug.getupvalue) or getupvalue
+    if type(gu) ~= "function" then return nil, 0, nil end
+    local best, bestN, where = nil, 0, nil
+    local function consider(t, tag)
+        local n = _channelCount(t)
+        if n > bestN then best, bestN, where = t, n, tag end
+    end
+    for fname, fn in next, mod do
+        if type(fn) == "function" then
+            for i = 1, 24 do
+                local o, u = pcall(gu, fn, i)
+                if not o then break end
+                if type(u) == "table" then
+                    consider(u, tostring(fname) .. "/" .. i)
+                    for j = 1, 4 do
+                        consider(rawget(u, j), tostring(fname) .. "/" .. i .. "/" .. j)
+                    end
+                end
+            end
+        end
+    end
+    return best, bestN, where
+end
+
+-- Retry with a fast burst for the first 3s (the registry is often empty at the
+-- moment the script runs), then back off, then give up after MAX_ATTEMPTS so a
+-- game where this genuinely does not exist cannot burn CPU on every lookup.
+local function _chans()
+    if _xchan then return _xchan end
+    if (os.clock() - _lastTry) <= _retryGap() then return nil end
+    _lastTry = os.clock()
+
+    local mod = _module()
+    if not mod or _attempts >= MAX_ATTEMPTS then return nil end
+    _attempts = _attempts + 1
+
+    local found, n, where = _probe(mod)
+    if not found and _deepScans < MAX_DEEP and (os.clock() - _lastDeep) > DEEP_GAP then
+        _lastDeep = os.clock()
+        _deepScans = _deepScans + 1
+        found, n, where = _deepScan(mod)
+    end
+
+    if found then
+        _xchan = found
+        _G.XenSyncDiag = string.format("bypassed via %s - %d channels (attempt %d)",
+            tostring(where), n, _attempts)
+    elseif _attempts >= MAX_ATTEMPTS then
+        _G.XenSyncDiag = "channels NOT found after " .. MAX_ATTEMPTS
+            .. " attempts - plot scanning is disabled"
+    end
+    return _xchan
+end
+
+_G.XenSyncAll=function()return _chans()end
+_G.XenSyncGet=function(idx)
+local t=_chans()
+if not t or idx==nil then return nil end
+local ok,cd=pcall(rawget,t,idx)
+if ok and type(cd)=="table" then return cd end
+local ok2,cd2=pcall(function() return t[idx] end)
+if ok2 and type(cd2)=="table" then return cd2 end
+return nil
+end
+-- Raw channel property read (the BYPASS): never calls channel:Get(key) -- the
+-- hookable/patched surface -- it reads CacheTable directly with rawget, falling
+-- back to plain indexing only for proxy/__index-backed registries.
+_G.sProp=function(ch,key)
+if type(ch)~="table" or key==nil then return nil end
+local ct=rawget(ch,"CacheTable")
+if type(ct)~="table" then
+local okC,c2=pcall(function() return ch.CacheTable end)
+if okC and type(c2)=="table" then ct=c2 end
+end
+if type(ct)~="table" then return nil end
+local v=rawget(ct,key)
+if v~=nil then return v end
+local okV,v2=pcall(function() return ct[key] end)
+if okV then return v2 end
+return nil
+end
+_G._xenRawCT=function(plotName)
+local c=_G.XenSyncGet(plotName)
+if not c then return nil end
+return rawget(c,"CacheTable")
+end
+local _AD,_MD,_TD
+local function _data()
+if _AD then return true end
+local ok=pcall(function()
+local d=game:GetService("ReplicatedStorage"):WaitForChild("Datas")
+_AD=require(d:WaitForChild("Animals"))
+_MD=require(d:WaitForChild("Mutations"))
+_TD=require(d:WaitForChild("Traits"))
+end)
+return ok and _AD~=nil
+end
+_G._xenGen=function(index,mutation,traits)
+if not _data() then return 0 end
+local info=_AD[index]
+if not info or not info.Generation then return 0 end
+local mult=1
+if mutation and mutation~="None" and mutation~="" then
+local m=_MD[mutation]
+if m and m.Modifier then mult=mult+m.Modifier end
+end
+if type(traits)=="table" then
+for _,tr in ipairs(traits)do
+local t=_TD[tr]
+if t and t.MultiplierModifier then mult=mult+t.MultiplierModifier end
+end
+end
+return info.Generation*mult
+end
+_G._xenAnimShim=setmetatable({GetGeneration=function(_,index,mutation,traits)return _G._xenGen(index,mutation,traits)end},{
+__index=function(_,k)
+local ok,real=pcall(function()return require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Animals"))end)
+if ok and type(real)=="table" then return rawget(real,k) end
+return nil
+end})
+_G.SXE_GetPlotChannel=function(plotName)return _G.XenSyncGet(plotName)end
+_G.SXE_GetAllPlots=function()return _G.XenSyncAll() or {} end
+_G.SXE_GetPlotAnimalList=function(plotName)
+local ct=_G._xenRawCT(plotName)
+local al=ct and ct.AnimalList
+return type(al)=="table" and al or nil
+end
+end
+
+-- EARLY DATA FORCE-LOAD (overlaps the ENTIRE rest of the hub's load) -----------
+-- The TP can't fire until plot data has replicated to you. Instead of waiting for
+-- that lazily during the first scan, start hammering every plot channel the instant
+-- the sync accessors exist -- while the UI and everything else is still building --
+-- so by the time the TP engine is ready the data is already cached and TP fires
+-- immediately. Uses the game's own :Get() (forces a fetch if the channel lazy-loads)
+-- then verifies via sProp, and drops each channel once its data is present so the
+-- cost is bounded and it can't spin forever.
+task.spawn(function()
+    local WS = game:GetService("Workspace")
+    local plots
+    local t0 = os.clock()
+    repeat
+        plots = WS:FindFirstChild("Plots")
+        if not plots then task.wait(0.05) end
+    until plots or (os.clock() - t0) > 25
+    if not plots then return end
+    local done, warmT0 = {}, os.clock()
+    while (os.clock() - warmT0) < 15 do
+        local kids = plots:GetChildren()
+        local pending = false
+        for _, plot in ipairs(kids) do
+            if not done[plot.Name] then
+                local ch = _G.XenSyncGet and _G.XenSyncGet(plot.Name)
+                if ch then
+                    pcall(function() if ch.Get then ch:Get("AnimalList"); ch:Get("Owner") end end)
+                    local al = _G.sProp and _G.sProp(ch, "AnimalList")
+                    if al ~= nil then done[plot.Name] = true else pending = true end
+                else
+                    pending = true
+                end
+            end
+        end
+        if not pending and #kids > 0 then break end
+        task.wait(0.05)
+    end
+    if _G.__LMARK then _G.__LMARK("plot data force-loaded") end
+end)
+
+-- EARLY STREAM-IN (forces the brainrot plots to load so the scan sees them fast) --
+-- If the game uses StreamingEnabled, distant plots' brainrot models aren't loaded on
+-- join, so getPetPosition() can't find them and the scan skips those plots until they
+-- stream in on their own. RequestStreamAroundAsync tells the server to stream each
+-- plot area in NOW. No-op (returns instantly) if the game doesn't use streaming --
+-- which also confirms whether streaming was ever the bottleneck.
+task.spawn(function()
+    local Players = game:GetService("Players")
+    local WS = game:GetService("Workspace")
+    local lp = Players.LocalPlayer
+    if not WS.StreamingEnabled then
+        if _G.__LMARK then _G.__LMARK("stream-in skipped (no StreamingEnabled)") end
+        return
+    end
+    local plots
+    local t0 = os.clock()
+    repeat plots = WS:FindFirstChild("Plots"); if not plots then task.wait(0.1) end
+    until plots or (os.clock() - t0) > 25
+    if not plots then return end
+    local function plotPos(plot)
+        local okp, pv = pcall(function() return plot:GetPivot().Position end)
+        if okp and pv and pv.Magnitude > 1 then return pv end
+        if plot.PrimaryPart then return plot.PrimaryPart.Position end
+        local bp = plot:FindFirstChildWhichIsA("BasePart", true)
+        return bp and bp.Position or nil
+    end
+    local pending = 0
+    for _, plot in ipairs(plots:GetChildren()) do
+        local pos = plotPos(plot)
+        if pos then
+            pending = pending + 1
+            task.spawn(function()
+                pcall(function() lp:RequestStreamAroundAsync(pos) end)
+                pending = pending - 1
+            end)
+        end
+    end
+    local sw = os.clock()
+    while pending > 0 and os.clock() - sw < 10 do task.wait(0.05) end
+    if _G.__LMARK then _G.__LMARK("plots stream-in requested") end
+end)
+
+do
+  if not _G.__SXENetBuilt then
+    _G.__SXENetBuilt = true
+    local netFolder = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
+    local getupvalues = debug.getupvalues or getupvalues
+    local getinfo = debug.getinfo or getinfo
+
+    local F1, F2, secret
+
+    local function isGuid(s)
+        return type(s) == "string" and #s == 36
+            and s:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
+    end
+
+    local _bufFromString = buffer.fromstring or function(s)
+        local b = buffer.create(#s)
+        buffer.writestring(b, 0, s)
+        return b
+    end
+
+    local _lastBuild, _buildFails = 0, 0
+    local function build()
+        if F1 and secret then return true end
+        -- getgc(true) below walks the ENTIRE Lua heap -- extremely heavy. If a
+        -- recent attempt already failed (e.g. the game update broke the hashing-
+        -- function detection), skip re-scanning so repeated resolves can't run it
+        -- on a loop and tank FPS periodically. Retry at most once every 15s, and
+        -- give up entirely after 4 fails (it's broken this session -- the grapple
+        -- and clone use the hook-free alias resolver instead, so this isn't needed).
+        if _buildFails >= 4 then return false end
+        if (os.clock() - _lastBuild) < 15 then return false end
+        _lastBuild = os.clock()
+        _buildFails = _buildFails + 1   -- counted as a fail; on success F1/secret set + short-circuit above
+        local jobId = game.JobId
+        local a, b
+        local cands, seen = {}, {}
+        local _srcMatches = 0
+        local _srcSamples = {}
+        local _cloneFn = clonefunction or function(f) return f end
+        if not getgc then
+            warn("[SXE Net] build() FAILED - getgc not available")
+            return false
+        end
+        for _, v in getgc(true) do
+            if typeof(v) == "function" then
+                local ok, info = pcall(getinfo, v)
+                if ok and info and info.source then
+                    local src = info.source
+                    local matched = (src == "=ReplicatedStorage.Packages.Net.Net")
+                        or (src:find("ReplicatedStorage", 1, true) and src:find("Net", 1, true))
+                    if matched then
+                        _srcMatches = _srcMatches + 1
+                        if #_srcSamples < 5 then _srcSamples[#_srcSamples + 1] = src end
+                        local ok2, ups = pcall(getupvalues, v)
+                        if ok2 and ups then
+                            for _, up in pairs(ups) do
+                                if type(up) == "table" then
+                                    local x, y, z = rawget(up, 1), rawget(up, 2), rawget(up, 3)
+                                    if not a and type(x) == "function" and type(y) == "function" and type(z) == "string" then
+                                        a, b = _cloneFn(x), _cloneFn(y)
+                                    end
+                                    for _, e in pairs(up) do
+                                        if isGuid(e) and e ~= jobId and not seen[e] then seen[e] = true; cands[#cands + 1] = e end
+                                    end
+                                elseif isGuid(up) and up ~= jobId and not seen[up] then
+                                    seen[up] = true; cands[#cands + 1] = up
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if not a then
+            warn("[SXE Net] build() FAILED - no hashing functions found.")
+            warn("[SXE Net] Source matches:", _srcMatches, "Samples:", table.concat(_srcSamples, ", "))
+            pcall(function()
+                local children = netFolder:GetChildren()
+                warn("[SXE Net] Net folder has", #children, "children. First few:")
+                for i = 1, math.min(5, #children) do
+                    warn("[SXE Net]   ", children[i].Name)
+                end
+            end)
+            return false
+        end
+        F1, F2 = a, b
+        local cipher = F2("UseItem", jobId)
+        if #cands == 1 then secret = cands[1]; print("[SXE Net] build() OK (single candidate)"); return true end
+        for _, sec in ipairs(cands) do
+            local ok, h = pcall(function() return F1(_bufFromString(cipher), _bufFromString(sec .. jobId)) end)
+            if ok and type(h) == "string" and netFolder:FindFirstChild("RE/" .. h) then secret = sec; print("[SXE Net] build() OK (multi candidate, resolved)"); return true end
+        end
+        warn("[SXE Net] build() FAILED - found", #cands, "GUID candidates but none resolved a valid remote.")
+        pcall(function()
+            local children = netFolder:GetChildren()
+            warn("[SXE Net] Net folder has", #children, "children. First few:")
+            for i = 1, math.min(5, #children) do
+                warn("[SXE Net]   ", children[i].Name)
+            end
+        end)
+        return false
+    end
+
+    local _resolveWarned = {}
+    local function resolve(prefix, name)
+        -- 1) Try unhashed direct lookup first (game update exposed many remotes)
+        local direct = netFolder:FindFirstChild(prefix .. "/" .. name)
+        if direct then return direct end
+        -- 2) Try hashing
+        if not (F1 and secret) and not build() then
+            if not _resolveWarned[name] then
+                _resolveWarned[name] = true
+                warn("[SXE Net] resolve('" .. name .. "') FAILED - build() failed and no unhashed '" .. prefix .. "/" .. name .. "' found.")
+            end
+            return nil
+        end
+        local jobId = game.JobId
+        local ok, h = pcall(function()
+            local c = F2(name, jobId)
+            return F1(_bufFromString(c), _bufFromString(secret .. jobId))
+        end)
+        if not ok or type(h) ~= "string" then
+            if not _resolveWarned[name] then
+                _resolveWarned[name] = true
+                warn("[SXE Net] resolve('" .. name .. "') FAILED - hash error:", tostring(h))
+            end
+            return nil
+        end
+        local remote = netFolder:FindFirstChild(prefix .. "/" .. h)
+        if not remote then
+            if not _resolveWarned[name] then
+                _resolveWarned[name] = true
+                warn("[SXE Net] resolve('" .. name .. "') FAILED - remote '" .. prefix .. "/" .. h .. "' not found in Net folder.")
+            end
+            return nil
+        end
+        return remote
+    end
+
+    -- Universal remote getter: tries RE, RF, URE prefixes (unhashed then hashed)
+    local function getRemoteAny(name)
+        for _, pfx in ipairs({"RE", "RF", "URE"}) do
+            local r = resolve(pfx, name)
+            if r then return r end
+        end
+        return nil
+    end
+
+_G.Net = {
+        RemoteEvent           = function(_, name) return resolve("RE", name) end,
+        RemoteFunction        = function(_, name) return resolve("RF", name) end,
+        UnreliableRemoteEvent = function(_, name) return resolve("URE", name) end,
+        GetRemote             = function(_, name) return getRemoteAny(name) end,
+    }
+
+    -- Helper: fire any remote (RemoteEvent or RemoteFunction) with args
+    _G.Net.FireServer = function(_, name, ...)
+        local r = getRemoteAny(name)
+        if not r then return false end
+        local args = {...}
+        if r:IsA("RemoteFunction") then
+            return pcall(function() return r:InvokeServer(table.unpack(args)) end)
+        else
+            return pcall(function() r:FireServer(table.unpack(args)) end)
+        end
+    end
+  end -- closes if not __SXENetBuilt
+end -- closes do
+
+-- Always patch _G.Net with GetRemote/FireServer (survives re-exec when __SXENetBuilt is already true)
+do
+    local _netFolder = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
+    local function _resolveAny(prefix, name)
+        local direct = _netFolder:FindFirstChild(prefix .. "/" .. name)
+        if direct then return direct end
+        return nil
+    end
+    local function _getRemoteAny(name)
+        for _, pfx in ipairs({"RE", "RF", "URE"}) do
+            local r = _resolveAny(pfx, name)
+            if r then return r end
+        end
+        -- Try hashed resolution if available
+        if _G.Net and _G.Net.RemoteEvent then
+            for _, pfx in ipairs({"RE", "RF", "URE"}) do
+                local r = _G.Net[pfx == "RE" and "RemoteEvent" or (pfx == "RF" and "RemoteFunction" or "UnreliableRemoteEvent")]
+                if r then
+                    local ok, remote = pcall(r, _G.Net, name)
+                    if ok and remote then return remote end
+                end
+            end
+        end
+        return nil
+    end
+    if _G.Net then
+        _G.Net.GetRemote = function(_, name) return _getRemoteAny(name) end
+        _G.Net.FireServer = function(_, name, ...)
+            local r = _getRemoteAny(name)
+            if not r then return false end
+            local args = {...}
+            if r:IsA("RemoteFunction") then
+                return pcall(function() return r:InvokeServer(table.unpack(args)) end)
+            else
+                return pcall(function() r:FireServer(table.unpack(args)) end)
+            end
+        end
+        -- Patch RemoteEvent to cross-prefix fallback when hashed resolution fails
+        local _origRE = _G.Net.RemoteEvent
+        _G.Net.RemoteEvent = function(_, name)
+            local r = _origRE and _origRE(_, name)
+            if r then return r end
+            return _getRemoteAny(name)
+        end
+    end
+end
+
+-- FPS UNLOCK / optimizer (ported from the other hub). 0 = fully uncapped (vs the
+-- old one-shot 999). Some game/engine paths silently re-cap the framerate, so a
+-- light keeper re-applies the cap every 2s instead of setting it once. Override
+-- with _G.SXE_FPS_CAP before load (0 = unlimited, or a number to cap).
+_G.SXE_FPS_CAP = _G.SXE_FPS_CAP or 999
+do
+    local function applyCap()
+        if not setfpscap then return end
+        pcall(setfpscap, tonumber(_G.SXE_FPS_CAP) or 999)
+    end
+    applyCap()
+    task.spawn(function()
+        while true do
+            applyCap()
+            task.wait(2)
+        end
+    end)
+end
 
 -- Insta-reset state captured by the FireServer hook below.
 -- GUID is the first arg of the balloon payload. Defaults to a randomly-generated
@@ -69,24 +640,210 @@ GUID = GUID or _G.SXE_RESET_GUID or _newGUID()
 resetRemote = nil
 instaResetCooldown = false
 
-local old; old = hookfunction(Instance.new("RemoteEvent").FireServer, function(self, ...)
-    local args = {...}
-    local arg1 = args[1]
+-- HOOK REMOVED. This used to hookfunction(FireServer) to (a) capture the first
+-- RE/* the game fires as the insta-reset target and (b) drop outgoing
+-- "StopTrying" messages. The game update added an anti-cheat canary that
+-- integrity-checks the remote-fire path, so ANY FireServer/__namecall hook now
+-- flags the account (the "Unable to cast Array to bool" error). Going hook-free
+-- is the only way to stay undetected.
+--
+-- Insta-reset is re-enabled hook-free further down (balloon method: it resolves
+-- the item-use remote via the dual-hash resolver instead of capturing it from a
+-- hook). You can optionally pin the reset remote by setting one of these before
+-- the script runs; otherwise it auto-resolves:
+--   _G.SXE_RESET_REMOTE = <a RemoteEvent instance>      -- direct, or
+--   _G.SXE_RESET_REMOTE = "PlaintextRemoteName"          -- resolved via _G.Net
+if _G.SXE_RESET_REMOTE ~= nil then
+    if typeof(_G.SXE_RESET_REMOTE) == "Instance" then
+        resetRemote = _G.SXE_RESET_REMOTE
+    elseif type(_G.SXE_RESET_REMOTE) == "string" and _G.Net then
+        pcall(function()
+            resetRemote = (_G.Net.GetRemote and _G.Net:GetRemote(_G.SXE_RESET_REMOTE))
+                or _G.Net:RemoteEvent(_G.SXE_RESET_REMOTE)
+        end)
+    end
+end
 
-    -- Capture the first RE/* remote the game itself fires -- that's the reset
-    -- target for instareset() below.
-    if not resetRemote and self.Name:sub(1, 3) == "RE/" then
-        resetRemote = self
+-- =====================================================================
+-- USEITEM REMOTE RESOLVER  (HOOK-FREE -- dual-hash resolve + saved payload)
+-- ---------------------------------------------------------------------
+-- The grapple/Quantum Cloner fire RE/UseItem, but the functional remote is
+-- HASH-NAMED and the hash ROTATES every server join. The plaintext "RE/UseItem"
+-- entry is a DEAD alias -- firing it does nothing.
+--
+-- Resolution history (each broke in turn):
+--   1. FindFirstChild("RE/UseItem")      -> returns the dead alias.
+--   2. Adjacency ([hashed][plaintext])   -> the update moved all plaintext
+--      aliases into their OWN region (alias at index ~397, real remote at ~6),
+--      so the pairing no longer exists.
+--   3. The game's own hash function      -> getgc can no longer locate F1/F2.
+--
+-- What still works: PASSIVE CAPTURE. A __namecall hook watches for the game
+-- firing a hash-named RE with a single number arg while the Grapple Hook is
+-- equipped -- that is unambiguously the grapple -- and remembers it for the
+-- session (hash is stable until you rejoin). Cached in _G so it survives
+-- script re-execution. Adjacency + Net module are kept as fallbacks in case a
+-- future update restores them.
+--
+-- The arg is a FLOAT (grapple distance/time), NOT the old int 2.
+-- =====================================================================
+_G.SXEGrappleValue = _G.SXEGrappleValue or 0.33  -- live-tunable grapple distance value
+_G.__SXEUseItemPayload = _G.__SXEUseItemPayload or nil
+do
+    local RS = game:GetService("ReplicatedStorage")
+    local netFolder = RS:WaitForChild("Packages"):WaitForChild("Net")
+    local PAYLOAD_FILE = "sxe_grapple_payload.txt"
+
+    local function isHashName(nm)
+        return type(nm) == "string"
+            and (nm:match("^RE/%x%x%x%x%x%x%x%x") or nm:match("^RF/%x%x%x%x%x%x%x%x")) ~= nil
+    end
+    local function isHashRemote(ch, className)
+        return ch and ch:IsA(className) and isHashName(ch.Name)
     end
 
-    if #self.Name == 67 and arg1 and typeof(arg1) == "string" then
-        if string.find(arg1, "StopTrying") then
-            print("ez bypass")
-            return
+    -- =====================================================================
+    -- HOOK-FREE (the game update added an anti-cheat canary that integrity-
+    -- checks __namecall -- the old passive-capture hook here tripped it, which
+    -- produced the "Unable to cast Array to bool" error in AssetStreamController
+    -- and flagged the account even without firing). So: NO hooks. The remote is
+    -- found structurally (dual-hash) and the payload is read from the file the
+    -- standalone tester saved. Both are pure reads -- nothing to canary.
+    -- =====================================================================
+
+    -- DUAL-HASH FINGERPRINT: "UseItem" is the ONLY name the game registers as
+    -- both an RF and an RE, so the one hash that exists as both RF/<h> and
+    -- RE/<h> IS UseItem. Structural, not an ordering guess -> survives the
+    -- per-join hash rotation and the folder reshuffle with no hook, no manual
+    -- fire. Returns nil unless the match is UNAMBIGUOUS (exactly one).
+    local _dualCache
+    local function findUseItemByDualHash()
+        if _dualCache and _dualCache.Parent then return _dualCache end
+        local reH, rfH = {}, {}
+        for _, ch in ipairs(netFolder:GetChildren()) do
+            local nm = ch.Name
+            if type(nm) == "string" then
+                local pfx, rest = nm:match("^(R[EF])/(.+)$")
+                if pfx and rest and #rest >= 32 and rest:match("^%x%x%x%x%x%x%x%x") then
+                    if pfx == "RE" then reH[rest] = ch else rfH[rest] = ch end
+                end
+            end
         end
+        local found, count = nil, 0
+        for h, ch in pairs(reH) do
+            if rfH[h] then count = count + 1; found = ch end
+        end
+        if count == 1 then _dualCache = found; return found end
+        return nil   -- ambiguous: do not guess
     end
-    return old(self, ...)
-end)
+    _G.SXEFindUseItem = findUseItemByDualHash
+
+    -- Resolve the live hashed remote for a plaintext name (hook-free).
+    local function resolveHashed(name, className)
+        className = className or "RemoteEvent"
+        if name == "UseItem" then
+            -- dual-hash fingerprint (deterministic, no hook, no manual fire)
+            local d = findUseItemByDualHash()
+            if d then return d end
+        end
+        local prefix = (className == "RemoteFunction") and "RF/" or "RE/"
+        -- adjacency (works only if a future update restores the pairing)
+        local children = netFolder:GetChildren()
+        local aliasIdx
+        for i, ch in ipairs(children) do
+            if ch.Name == prefix .. name and ch:IsA(className) then aliasIdx = i; break end
+        end
+        if aliasIdx then
+            if isHashRemote(children[aliasIdx - 1], className) then return children[aliasIdx - 1] end
+            if isHashRemote(children[aliasIdx + 1], className) then return children[aliasIdx + 1] end
+        end
+        -- the game's own Net module hasher, if it ever works again
+        if _G.Net then
+            local ok, r = pcall(function()
+                return (_G.Net.GetRemote and _G.Net:GetRemote(name)) or _G.Net:RemoteEvent(name)
+            end)
+            -- reject the dead plaintext alias -- only accept a hashed instance
+            if ok and typeof(r) == "Instance" and isHashName(r.Name) then return r end
+        end
+        return nil
+    end
+    _G.SXEResolveHashed = resolveHashed
+
+    -- PAYLOAD: replay the exact args a legit grapple sends. The standalone
+    -- tester learns them from your own manual grapple (once) and saves them to
+    -- PAYLOAD_FILE; here we just read that file -- no hook needed. Set
+    -- _G.SXE_GRAPPLE_PAYLOAD = { [1]=<num>, n=1 } to override without a file.
+    local function loadPersistedPayload()
+        if _G.SXE_GRAPPLE_PAYLOAD then return _G.SXE_GRAPPLE_PAYLOAD end
+        if not (readfile and isfile) then return nil end
+        local ok, res = pcall(function()
+            if not isfile(PAYLOAD_FILE) then return nil end
+            local raw = readfile(PAYLOAD_FILE)
+            local lines = {}
+            for line in raw:gmatch("[^\n]+") do lines[#lines + 1] = line end
+            local n = tonumber(lines[1]); if not n then return nil end
+            local p = { n = n }
+            for i = 1, n do
+                local ln = lines[i + 1] or ""
+                local tag, rest = ln:sub(1, 2), ln:sub(3)
+                if tag == "s:" then p[i] = rest
+                elseif tag == "n:" then p[i] = tonumber(rest)
+                elseif tag == "b:" then p[i] = (rest == "true")
+                else p[i] = nil end
+            end
+            return p
+        end)
+        return ok and res or nil
+    end
+    _G.__SXEUseItemPayload = loadPersistedPayload()
+
+    -- WARM-UP: the Net folder is still streaming in when TP-on-load fires, so an
+    -- early fingerprint scan sees an incomplete folder and returns nil. Resolve
+    -- it in the background so it's cached and ready before the first TP.
+    task.spawn(function()
+        local t0 = os.clock()
+        while os.clock() - t0 < 60 do
+            if findUseItemByDualHash() then
+                warn("[SXE] UseItem resolved: " .. _G.SXEFindUseItem().Name)
+                return
+            end
+            task.wait(0.25)
+        end
+    end)
+
+    -- Fire the grapple HOOK-FREE: resolve the hashed UseItem RE and replay the
+    -- learned payload (falls back to the scalar grapple value if nothing saved).
+    _G.SXEFireGrapple2 = function(value)
+        local r = resolveHashed("UseItem", "RemoteEvent")
+        -- Short bounded retry: on a fresh join the folder may still be
+        -- replicating, so don't give up on the very first miss.
+        if not r then
+            local t0 = os.clock()
+            repeat
+                task.wait(0.05)
+                r = resolveHashed("UseItem", "RemoteEvent")
+            until r or (os.clock() - t0) > 1.5
+        end
+        if not r then
+            if not _G.__SXEGrappleWarned then
+                _G.__SXEGrappleWarned = true
+                warn("[SXE] Grapple remote unresolved (Net folder still streaming?)")
+            end
+            return false
+        end
+        local p = _G.__SXEUseItemPayload
+        if p and p.n then
+            -- exact replay of a legit fire -> indistinguishable server-side
+            return (pcall(function() r:FireServer(table.unpack(p, 1, p.n)) end))
+        end
+        -- no saved payload: fall back to the scalar grapple value
+        return (pcall(function()
+            r:FireServer(tonumber(value) or tonumber(_G.SXEGrappleValue) or 0.33)
+        end))
+    end
+
+    _G.SXEGrappleReady = function() return resolveHashed("UseItem", "RemoteEvent") ~= nil end
+end
 
 -- LPH_NO_VIRTUALIZE: real preprocessor directive under Luraph; harmless passthrough
 -- everywhere else. Declared once globally so every heavy hot-path body can wrap
@@ -240,7 +997,15 @@ local function setupCameraListener()
     if cameraConn then pcall(function() cameraConn:Disconnect() end) end
     local cam = Workspace.CurrentCamera
     if cam then
-        cameraConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(recalculateScale)
+        local _sd = false
+        cameraConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            if _sd then return end
+            _sd = true
+            task.delay(0.2, function()
+                _sd = false
+                recalculateScale()
+            end)
+        end)
         recalculateScale()
     end
 end
@@ -250,6 +1015,57 @@ task.spawn(setupCameraListener)
 local old = playerGui:FindFirstChild("SXEHub_V3"); if old then old:Destroy() end
 local gui_sg = Instance.new("ScreenGui"); gui_sg.Name = "SXEHub_V3"; gui_sg.ResetOnSpawn = false; gui_sg.IgnoreGuiInset = true; gui_sg.DisplayOrder = 9999999; gui_sg.Parent = playerGui
 local gui = registerScreenGui(gui_sg)
+
+-- JP Button: top-of-screen button to join private server
+do
+    local jpSg = Instance.new("ScreenGui")
+    jpSg.Name = "SXEHub_JPButton"
+    jpSg.ResetOnSpawn = false
+    jpSg.IgnoreGuiInset = true
+    jpSg.DisplayOrder = 9999998
+    jpSg.Parent = playerGui
+
+    local jpBtn = Instance.new("TextButton")
+    jpBtn.Name = "JPButton"
+    jpBtn.Size = UDim2.new(0, 48, 0, 28)
+    jpBtn.Position = UDim2.new(0.5, -24, 0, 8)
+    jpBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    jpBtn.BackgroundTransparency = 0.1
+    jpBtn.BorderSizePixel = 0
+    jpBtn.Text = "JP"
+    jpBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    jpBtn.Font = Enum.Font.GothamBlack
+    jpBtn.TextSize = 14
+    jpBtn.AutoButtonColor = false
+    jpBtn.Parent = jpSg
+    local jpCorner = Instance.new("UICorner"); jpCorner.CornerRadius = UDim.new(0, 7); jpCorner.Parent = jpBtn
+    local jpStroke = Instance.new("UIStroke"); jpStroke.Color = Color3.fromRGB(80,80,80); jpStroke.Thickness = 1.2; jpStroke.Transparency = 0.3; jpStroke.Parent = jpBtn
+
+    jpBtn.MouseButton1Click:Connect(function()
+        if PrivateServerCode and PrivateServerCode ~= "" then
+            jpBtn.Text = "..."
+            task.spawn(function()
+                local ok = pcall(function()
+                    TeleportService:TeleportToPrivateServer(game.PlaceId, PrivateServerCode, {LocalPlayer})
+                end)
+                if not ok then
+                    pcall(function()
+                        game:GetService("ExperienceService"):LaunchExperience({placeId=game.PlaceId, linkCode=PrivateServerCode})
+                    end)
+                end
+                task.wait(3)
+                jpBtn.Text = "JP"
+            end)
+        else
+            jpBtn.Text = "!PS"
+            task.delay(2, function() jpBtn.Text = "JP" end)
+        end
+    end)
+
+    -- Hover effect
+    jpBtn.MouseEnter:Connect(function() jpBtn.BackgroundColor3 = Color3.fromRGB(50,50,50) end)
+    jpBtn.MouseLeave:Connect(function() jpBtn.BackgroundColor3 = Color3.fromRGB(20,20,20) end)
+end
 
 -- SHARED TOGGLE STATE
 local ToggleState = {}
@@ -276,32 +1092,32 @@ local loadConfig
 -- THEME (SXE Pink)
 Themes = {
     Light = {
-        Background=Color3.fromRGB(255,255,255), MainBackground=Color3.fromRGB(255,252,255),
-        Panel=Color3.fromRGB(255,249,252), Row=Color3.fromRGB(252,245,249), RowHover=Color3.fromRGB(250,238,245),
-        Accent=Color3.fromRGB(232,111,177), AccentLight=Color3.fromRGB(238,98,178),
-        Green=Color3.fromRGB(235,117,181), Red=Color3.fromRGB(237,150,189), Red2=Color3.fromRGB(220,104,162),
-        Text=Color3.fromRGB(236,108,174), Dim=Color3.fromRGB(205,151,180), Stroke=Color3.fromRGB(248,188,219),
-        SoftButton=Color3.fromRGB(249,240,245), SoftButtonHover=Color3.fromRGB(246,232,240),
-        SoftAccent=Color3.fromRGB(244,223,233), SoftAccentHover=Color3.fromRGB(241,213,228),
-        ToggleOff=Color3.fromRGB(255,231,243), ToggleOff2=Color3.fromRGB(255,236,245),
-        InputBg=Color3.fromRGB(255,255,255), SliderBg=Color3.fromRGB(243,204,223),
-        BlacklistHover=Color3.fromRGB(255,220,225), BlacklistLeave=Color3.fromRGB(255,240,248),
+        Background=Color3.fromRGB(255,255,255), MainBackground=Color3.fromRGB(245,245,245),
+        Panel=Color3.fromRGB(235,235,235), Row=Color3.fromRGB(225,225,225), RowHover=Color3.fromRGB(210,210,210),
+        Accent=Color3.fromRGB(30,30,30), AccentLight=Color3.fromRGB(50,50,50),
+        Green=Color3.fromRGB(40,40,40), Red=Color3.fromRGB(60,60,60), Red2=Color3.fromRGB(20,20,20),
+        Text=Color3.fromRGB(20,20,20), Dim=Color3.fromRGB(100,100,100), Stroke=Color3.fromRGB(180,180,180),
+        SoftButton=Color3.fromRGB(220,220,220), SoftButtonHover=Color3.fromRGB(200,200,200),
+        SoftAccent=Color3.fromRGB(210,210,210), SoftAccentHover=Color3.fromRGB(195,195,195),
+        ToggleOff=Color3.fromRGB(200,200,200), ToggleOff2=Color3.fromRGB(200,200,200),
+        InputBg=Color3.fromRGB(255,255,255), SliderBg=Color3.fromRGB(180,180,180),
+        BlacklistHover=Color3.fromRGB(180,180,180), BlacklistLeave=Color3.fromRGB(220,220,220),
     },
     Dark = {
-        Background=Color3.fromRGB(20,20,20), MainBackground=Color3.fromRGB(15,15,15),
-        Panel=Color3.fromRGB(28,25,28), Row=Color3.fromRGB(35,30,35), RowHover=Color3.fromRGB(48,38,48),
-        Accent=Color3.fromRGB(232,111,177), AccentLight=Color3.fromRGB(238,98,178),
-        Green=Color3.fromRGB(235,117,181), Red=Color3.fromRGB(237,150,189), Red2=Color3.fromRGB(220,104,162),
-        Text=Color3.fromRGB(255,255,255), Dim=Color3.fromRGB(200,200,200), Stroke=Color3.fromRGB(60,40,55),
-        SoftButton=Color3.fromRGB(35,28,33), SoftButtonHover=Color3.fromRGB(45,35,42),
-        SoftAccent=Color3.fromRGB(55,38,48), SoftAccentHover=Color3.fromRGB(65,45,58),
-        ToggleOff=Color3.fromRGB(35,28,33), ToggleOff2=Color3.fromRGB(35,28,33),
-        InputBg=Color3.fromRGB(30,25,30), SliderBg=Color3.fromRGB(55,40,50),
-        BlacklistHover=Color3.fromRGB(80,35,45), BlacklistLeave=Color3.fromRGB(50,35,45),
+        Background=Color3.fromRGB(22,22,22), MainBackground=Color3.fromRGB(14,14,14),
+        Panel=Color3.fromRGB(30,30,30), Row=Color3.fromRGB(40,40,40), RowHover=Color3.fromRGB(55,55,55),
+        Accent=Color3.fromRGB(0,0,0), AccentLight=Color3.fromRGB(200,200,200),
+        Green=Color3.fromRGB(74,222,140), Red=Color3.fromRGB(240,85,110), Red2=Color3.fromRGB(201,45,80),
+        Text=Color3.fromRGB(240,240,240), Dim=Color3.fromRGB(150,150,150), Stroke=Color3.fromRGB(55,55,55),
+        SoftButton=Color3.fromRGB(40,40,40), SoftButtonHover=Color3.fromRGB(56,56,56),
+        SoftAccent=Color3.fromRGB(40,40,40), SoftAccentHover=Color3.fromRGB(56,56,56),
+        ToggleOff=Color3.fromRGB(46,46,46), ToggleOff2=Color3.fromRGB(46,46,46),
+        InputBg=Color3.fromRGB(28,28,28), SliderBg=Color3.fromRGB(60,60,60),
+        BlacklistHover=Color3.fromRGB(90,55,55), BlacklistLeave=Color3.fromRGB(56,56,56),
     }
 }
 Theme = {}
-for k, v in pairs(Themes.Light) do
+for k, v in pairs(Themes.Dark) do
     Theme[k] = v
 end
 
@@ -349,7 +1165,7 @@ function applyTheme(themeName)
             if child:IsA("UIStroke") then
                 child.Color = toTheme.AccentLight
             elseif child:IsA("TextLabel") then
-                if child.Text == "SXE HUB PRIVAT" or child.Text == "|" or child.Text == "discord.gg/sxehub" then
+                if child.Text == "|" or child.Text == "discord.gg/sxehub" then
                     child.TextColor3 = toTheme.AccentLight
                 elseif child.Text == "By:@SE67 and @SXLVATORE" then
                     child.TextColor3 = toTheme.Dim
@@ -682,7 +1498,7 @@ priorityList = {
 
 actionConfig = {
     ["Ragdoll Self (R)"]=true,["Rejoin PS"]=true,["Rejoin Job ID (J)"]=true,
-    ["Kick (Y)"]=true,["Kick To Private"]=true,["Reset (X)"]=true,
+    ["Kick (Y)"]=true,["Kick To Private"]=true,["JP"]=true,["Reset (X)"]=true,
     ["Anti Ragdoll"]=false,["Infinite Jump"]=false,["Float"]=false,["Carpet Speed"]=false,
 }
 
@@ -701,13 +1517,13 @@ loadPSCode()
 
 Config = {
     positions={},keybinds={},actions={},locked=false,
-    DarkMode=false,
+    DarkMode=true,
     AntiRagdoll=false,InfiniteJump=false,Float=false,
     AutoResetBalloon=false,AutoKickOnSteal=false,KickToPrivateServer=false,CleanErrorGUIs=false,
     LineToBase=false,LineToBrainrot=false,InvisStealAngle=225,SinkSliderValue=7,
     AutoRecoverLagback=true,
     WalkSpeedEnabled=false, WalkSpeedValue=16,
-    AutoTPPriority=true, AutoTPHighestGen=false, AutoTPHighestValue=false, FPSBoost=false, FPSBoostUltra=false, XRay=false, FOV=70,
+    AutoTPPriority=true, AutoTPHighestGen=false, AutoTPHighestValue=false, AutoTPFloor2FromFloor1=false, FPSBoost=false, FPSBoostUltra=false, XRay=false, FOV=70,
     BrainrotESP=true, TimerESP=false, SubspaceMineESP=false, PlayerESP=true, BaseOwnerESP=false,
     AutoBuyEnabled=false, AutoBuyRange=17, AutoGrabSpeed=17, AutoBuyKey="K",
     AutoDestroyTurrets=false, AutoUnlockOnSteal=false,
@@ -1007,8 +1823,9 @@ local function initToggles()
     setToggle("Steal Highest", Config.StealHighest, true)
     setToggle("Steal Priority", Config.StealPriority, true)
     setToggle("Steal Nearest", Config.StealNearest, true)
-    setToggle("Click to AP", Config.ClickToAP, true)
-    setToggle("ClickToAP", Config.ClickToAP, true)
+    Config.ClickToAP = true  -- on by default for a fresh start
+    setToggle("Click to AP", true, true)
+    setToggle("ClickToAP", true, true)
     setToggle("Click AP Single Cmd", Config.ClickToAPSingleCommand, true)
     setToggle("ClickToAPSingle", Config.ClickToAPSingleCommand, true)
     setToggle("FPS Boost (normal)", Config.FPSBoost, true)
@@ -1039,183 +1856,29 @@ local function initToggles()
     setToggle("Dark Mode", Config.DarkMode, true)
     setToggle("DarkMode", Config.DarkMode, true)
     setToggle("Grabble TP", Config.TpSettings.GrabbleTP or false, true)
+    setToggle("Fly TP", Config.TpSettings.FlyTP or false, true)
 end
 
 loadConfig()
-if Config.DarkMode then
-    for k, v in pairs(Themes.Dark) do
-        Theme[k] = v
-    end
+-- Force the dark theme regardless of any saved config (saved DarkMode=false was
+-- overriding the default and keeping the UI white after a workspace reset).
+Config.DarkMode = true
+for k, v in pairs(Themes.Dark) do
+    Theme[k] = v
 end
 for k,v in pairs(Config.keybinds or {}) do if Keybinds[k]~=nil and type(v)=="string" then Keybinds[k]=v; if k=="Open Menu" and Enum.KeyCode[v] then UI.OpenMenuKey=Enum.KeyCode[v] end end end
 for k,v in pairs(Config.actions or {}) do if actionConfig[k]~=nil then actionConfig[k]=v and true or false end end
 if type(Config.locked)=="boolean" then UI.Locked=Config.locked end
 initToggles()
 
--- SYNCHRONIZER DETECTION BYPASS + STEALTH CHANNEL READER 
-pcall(function()
-    local getupvalue = getupvalue or debug.getupvalue
-
-    local function getInternalTable()
-        local Packages = ReplicatedStorage:FindFirstChild("Packages")
-        if not Packages then return nil end
-        local SynMod = Packages:FindFirstChild("Synchronizer")
-        if not SynMod then return nil end
-        local ok, syn = pcall(require, SynMod)
-        if not ok or not syn then return nil end
-        local Get = syn.Get
-        if type(Get) ~= "function" then return nil end
-        for i = 1, 5 do
-            local s, u = pcall(getupvalue, Get, i)
-            if s and type(u) == "table" then
-                if u.___private or u.___channels or u.___data then return u end
-                for k, v in pairs(u) do
-                    if (type(k) == "string" and k:match("^Plot_")) or type(v) == "table" then
-                        return u
-                    end
-                end
-            end
-        end
-        local s, e = pcall(getfenv, Get)
-        if s and e and e.self then return e.self end
-        return nil
-    end
-
-    local SyncInt = {_cache = {}, _data = nil}
-    _G.SyncInt = SyncInt
-
-    task.spawn(function()
-        for i = 1, 10 do
-            SyncInt._data = getInternalTable()
-            if SyncInt._data then break end
-            task.wait(1)
-        end
-    end)
-
-    local function myCustomGet(self, prop)
-        if self[prop] then return self[prop] end
-        for _, sub in ipairs({"CacheTable", "Data", "_data", "state", "values"}) do
-            if type(self[sub]) == "table" and self[sub][prop] then
-                return self[sub][prop]
-            end
-        end
-        local alts = {
-            Owner = {"owner", "Owner", "plotOwner", "PlotOwner"},
-            AnimalList = {"animalList", "AnimalList", "animals", "Animals", "pets"},
-        }
-        if alts[prop] then
-            for _, a in ipairs(alts[prop]) do
-                if self[a] then return self[a] end
-                for _, sub in ipairs({"CacheTable", "Data", "_data", "state", "values"}) do
-                    if type(self[sub]) == "table" and self[sub][a] then
-                        return self[sub][a]
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    function _G.stealthGet(n)
-        if not n or type(n) ~= "string" then return nil end
-        if SyncInt._cache[n] == false then return nil end
-        local res = nil
-        if SyncInt._data then
-            for _, k in ipairs({n, "Plot_" .. n, "Plot" .. n, n .. "_Channel", "Channel_" .. n}) do
-                if SyncInt._data[k] then
-                    res = SyncInt._data[k]
-                    break
-                end
-            end
-            if not res then
-                for k, v in pairs(SyncInt._data) do
-                    if type(k) == "string" and (k == n or k:find(n, 1, true)) and type(v) == "table" then
-                        res = v
-                        break
-                    end
-                end
-            end
-        end
-        if res and type(res) == "table" then
-            if type(res.Get) ~= "function" then
-                rawset(res, "Get", myCustomGet)
-            end
-            SyncInt._cache[n] = res
-            return res
-        end
-        SyncInt._cache[n] = false
-        return nil
-    end
-
-    function _G.sProp(ch, p)
-        if not ch or type(ch) ~= "table" then return nil end
-        if ch[p] then return ch[p] end
-        for _, sub in ipairs({"CacheTable", "Data", "_data", "state", "values"}) do
-            if type(ch[sub]) == "table" and ch[sub][p] then
-                return ch[sub][p]
-            end
-        end
-        if type(ch.Get) == "function" and ch.Get ~= myCustomGet then
-            local ok, r = pcall(ch.Get, ch, p)
-            if ok then return r end
-        end
-        local alts = {
-            Owner = {"owner", "Owner", "plotOwner", "PlotOwner"},
-            AnimalList = {"animalList", "AnimalList", "animals", "Animals", "pets"},
-        }
-        if alts[p] then
-            for _, a in ipairs(alts[p]) do
-                if ch[a] then return ch[a] end
-                for _, sub in ipairs({"CacheTable", "Data", "_data", "state", "values"}) do
-                    if type(ch[sub]) == "table" and ch[sub][a] then
-                        return ch[sub][a]
-                    end
-                end
-            end
-        end
-        return nil
-    end
-
-    -- Setup value modification bypass
-    local Packages = ReplicatedStorage:FindFirstChild("Packages")
-    local SynMod = Packages and Packages:FindFirstChild("Synchronizer")
-    local okReq, syn = pcall(require, SynMod)
-    if okReq and typeof(syn) == "table" then
-        local function HasBoolUpvalue(Fn)
-            local OkU, Ups = xpcall(debug.getupvalues, function() end, Fn)
-            if not OkU then return false end
-            for _, V in pairs(Ups) do
-                if typeof(V) == "boolean" then return true end
-            end
-            return false
-        end
-        for _, Fn in pairs(syn) do
-            if typeof(Fn) == "function" and not isexecutorclosure(Fn) then
-                local OkU, Ups = xpcall(debug.getupvalues, function() end, Fn)
-                if OkU then
-                    for Idx, V in pairs(Ups) do
-                        if typeof(V) == "function" and not isexecutorclosure(V) and HasBoolUpvalue(V) then
-                            pcall(debug.setupvalue, Fn, Idx, newcclosure(function() end))
-                        end
-                    end
-                end
-            end
-        end
-
-        -- Hook Get method directly to route through stealthGet
-        -- local oldGet = syn.Get
-        -- if oldGet then
-        --     syn.Get = function(self, plotName)
-        --         local ch = _G.stealthGet(plotName)
-        --         if ch then return ch end
-        --         return oldGet(self, plotName)
-        --     end
-        -- end
-    end
-end)
 
 
 
+
+do
+_G.stealthGet=function(n) return _G.XenSyncGet(n) end
+_G.SyncInt={_cache={},_data=nil}
+end
 
 -- Decrypted net
 local Decrypted=setmetatable({},{__index=function(S,ez)
@@ -1281,6 +1944,89 @@ setToggle("SpamBaseOwnerSingleCommand", Config.SpamBaseOwnerSingleCommand or fal
 
 _G.apBlacklist = Config.apBlacklist or {}
 
+-- =====================================================================
+-- FMLY good/bad boy list -- good boys are PROTECTED (no admin commands can run
+-- on them); bad boys get a [BAD BOY] tag in the admin panel. Auto-refreshes.
+-- =====================================================================
+_G.SXEGoodBoys = _G.SXEGoodBoys or {}
+_G.SXEBadBoys  = _G.SXEBadBoys or {}
+do
+    local URL = "https://gist.githubusercontent.com/josecastle21/fcc5696b9d37ae086a324d99e6b8fa5e/raw/fmly_badboys.json"
+    local HttpService = game:GetService("HttpService")
+    local function httpGet(u)
+        local req = (syn and syn.request) or (http and http.request) or http_request or request
+        if req then
+            local ok, res = pcall(req, { Url = u, Method = "GET" })
+            if ok and res and res.Body then return res.Body end
+        end
+        local ok, body = pcall(function() return game:HttpGet(u) end)
+        if ok then return body end
+        return nil
+    end
+    local CACHE_FILE = "sxe_fmly_boys.json"   -- persisted across joins (executor filesystem)
+    local SIX_HOURS = 6 * 3600
+    local lastFetch = 0
+
+    -- apply {good=array, bad=array} into the lowercase lookup sets
+    local function applyArrays(goodArr, badArr)
+        local good, bad = {}, {}
+        if type(goodArr) == "table" then for _, n in ipairs(goodArr) do if type(n) == "string" then good[n:lower()] = true end end end
+        if type(badArr) == "table" then for _, n in ipairs(badArr) do if type(n) == "string" then bad[n:lower()] = true end end end
+        _G.SXEGoodBoys, _G.SXEBadBoys = good, bad
+        if _G.refreshAdminPanelRows then pcall(_G.refreshAdminPanelRows) end
+    end
+
+    local function loadCache()
+        local ok, raw = pcall(function()
+            if isfile and isfile(CACHE_FILE) then return readfile(CACHE_FILE) end
+        end)
+        if ok and type(raw) == "string" then
+            local ok2, c = pcall(function() return HttpService:JSONDecode(raw) end)
+            if ok2 and type(c) == "table" then return c end
+        end
+        return nil
+    end
+
+    -- Fetch fresh from the gist and save it (with a timestamp) to the cache file.
+    local function fetchAndSave()
+        local body = httpGet(URL .. "?cb=" .. tostring(os.time()))
+        if not body then return false end
+        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if not ok or type(data) ~= "table" then return false end
+        local goodArr = type(data.good) == "table" and data.good or {}
+        local badArr  = type(data.bad)  == "table" and data.bad  or {}
+        applyArrays(goodArr, badArr)
+        lastFetch = os.time()
+        pcall(function()
+            if writefile then
+                writefile(CACHE_FILE, HttpService:JSONEncode({ t = lastFetch, good = goodArr, bad = badArr }))
+            end
+        end)
+        return true
+    end
+
+    task.spawn(function()
+        -- 1) Load the saved cache instantly (no HTTP -> no join lag).
+        local cache = loadCache()
+        if cache then
+            applyArrays(cache.good, cache.bad)
+            if type(cache.t) == "number" then lastFetch = cache.t end
+        end
+        -- 2) Only actually fetch if 6h have passed since the last saved fetch
+        --    (across joins). Joining within 6h just uses the cache.
+        if (os.time() - lastFetch) >= SIX_HOURS then
+            pcall(fetchAndSave)
+        end
+        -- 3) Long-session check: cheap timestamp compare; fetches only when due.
+        while true do
+            task.wait(1800)  -- every 30 min, but only fetches once 6h has elapsed
+            if (os.time() - lastFetch) >= SIX_HOURS then pcall(fetchAndSave) end
+        end
+    end)
+end
+_G.SXEIsGoodBoy = function(plr) return plr ~= nil and _G.SXEGoodBoys[tostring(plr.Name):lower()] == true end
+_G.SXEIsBadBoy  = function(plr) return plr ~= nil and _G.SXEBadBoys[tostring(plr.Name):lower()] == true end
+
 local function isPlayerBlacklisted(plr)
     if not plr then return false end
     local uid = plr.UserId
@@ -1311,9 +2057,9 @@ local function getPlotOwner(plot)
     if not plot then return nil end
     local Synchronizer = _G.__getSync()
     if Synchronizer then
-        local ch = Synchronizer:Get(plot.Name)
+        local ch = _G.SXE_GetPlotChannel(plot.Name)
         if ch then
-            local owner = ch:Get("Owner")
+            local owner = _G.sProp(ch, "Owner")
             if owner then
                 if typeof(owner) == "Instance" and owner:IsA("Player") then
                     return owner
@@ -1435,9 +2181,9 @@ local function getStealingInfo(plr)
                             pcall(function()
                                 local Synchronizer = _G.__getSync()
                                 if Synchronizer then
-                                    local ch = Synchronizer:Get(plot.Name)
+                                    local ch = _G.SXE_GetPlotChannel(plot.Name)
                                     if ch then
-                                        local al = ch:Get("AnimalList")
+                                        local al = _G.sProp(ch, "AnimalList")
                                         local ad = al and (al[pod.Name] or al[tonumber(pod.Name)])
                                         if ad and type(ad) == "table" then
                                             local ok2, Datas = pcall(function() return ReplicatedStorage:FindFirstChild("Datas") end)
@@ -1593,7 +2339,7 @@ local function kickPlayer(stolenText)
         return
     end
     pcall(function() game:Shutdown() end)
-    pcall(function() LocalPlayer:Kick("\nSXE HUB PRIVAT") end)
+    pcall(function() LocalPlayer:Kick("") end)
 end
 
 -- SHARED STATE
@@ -1687,8 +2433,13 @@ shared.NotifyLocalTeleport = _G.NotifyLocalTeleport
 
 -- OPTIMIZED INCREMENTAL REMOTE EVENT SCANNER (For Generic Fallbacks)
 local function scanForRemotes()
+    -- DISABLED (FPS): this walked the ENTIRE ReplicatedStorage + Workspace +
+    -- PlayerGui tree on load AND every Config.ScanInterval (15s) via onHeartbeat,
+    -- just to fill `resetRemotes` -- which nothing reads anymore (reset now uses
+    -- the balloon method). It was a recurring full-game-tree BFS for nothing.
+    if true then return end
     table.clear(resetRemotes)
-    
+
     task.spawn(function()
         local searchAreas = {ReplicatedStorage, Workspace}
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -1743,8 +2494,11 @@ end
 
 -- --- DYNAMIC REMOTE INTERCEPTION (ToolActivationController Heartbeat Hook) ---
 local function hookHeartbeatRemote()
+    -- DISABLED: installs a FireServer/__namecall hook, which the updated anti-cheat
+    -- canaries. Kept for reference only; hard-returns so it can never install.
+    if true then return end
     local newcc = newcclosure or function(f) return f end
-    
+
     pcall(function()
         local seen = {}
         local capturing = true
@@ -1807,11 +2561,34 @@ local function hookHeartbeatRemote()
     end)
 end
 
--- INSTANT RESET (new.lua method) -- spams the captured RE/* reset remote with a
--- junk payload until the character respawns. This is the method that actually
--- works in THIS game (client Health/BreakJoints is server-authoritative and does
--- nothing). Robustness over new.lua: waits briefly for the remote to be captured
--- and time-caps the loop, so the cooldown can never get stuck = reset always fires.
+-- INSTANT RESET -- copied verbatim from RyukHub (message (2).txt). Captures the
+-- reset remote via a FireServer hook (the first RE/ the game itself fires), with a
+-- 2s descendant-scan fallback, then fires the balloon payload
+-- (GUID, LocalPlayer, "balloon") until the character actually respawns.
+-- NOTE: this re-adds a hookfunction(FireServer) hook. The anti-cheat canary we hit
+-- earlier was __namecall-specific and RyukHub runs this fine, but if the reset ever
+-- causes a flag, this hook is the thing to pull.
+local CURSED_RESET_GUID = _G.SXE_RESET_GUID or "f888ee6e-c86d-46e1-93d7-0639d6635d42"
+local cursedResetRemote = nil
+
+-- HOOK REMOVED (detection): this installed hookfunction(FireServer) on load to
+-- capture the reset remote. That FireServer hook trips the anti-cheat's remote-fire
+-- canary the moment the hub loads -- detected even without firing anything. The hub
+-- is now fully hook-free. cursedResetRemote falls back to the descendant scan below,
+-- or set _G.SXE_RESET_REMOTE (a RemoteEvent) before running to pin it.
+if typeof(_G.SXE_RESET_REMOTE) == "Instance" then cursedResetRemote = _G.SXE_RESET_REMOTE end
+
+task.spawn(function()
+    task.wait(2)
+    if cursedResetRemote then return end
+    for _, desc in ipairs(game:GetDescendants()) do
+        if desc:IsA("RemoteEvent") and desc.Name:sub(1,3) == "RE/" then
+            cursedResetRemote = desc
+            break
+        end
+    end
+end)
+
 local function instantReset()
     if instaResetCooldown then return end
     instaResetCooldown = true
@@ -1819,10 +2596,13 @@ local function instantReset()
     local oldChar = lp.Character
     task.spawn(function()
         local t0 = os.clock()
-        -- if the reset remote hasn't been captured yet, wait briefly for it
-        while not resetRemote and (os.clock() - t0) < 3 do task.wait() end
-        while resetRemote and lp.Character == oldChar and (os.clock() - t0) < 8 do
-            pcall(function() resetRemote:FireServer("randomstring") end)
+        -- OLD METHOD: spam the captured remote with a junk payload until the
+        -- character actually respawns (Character instance changes). cursedResetRemote
+        -- is the first RE/ the game fires. Waits briefly for the capture, then
+        -- time-caps the loop so the cooldown can't get stuck.
+        while not cursedResetRemote and (os.clock() - t0) < 3 do task.wait() end
+        while cursedResetRemote and lp.Character == oldChar and (os.clock() - t0) < 8 do
+            pcall(function() cursedResetRemote:FireServer("randomstring") end)
             task.wait()
         end
         instaResetCooldown = false
@@ -1910,6 +2690,7 @@ local function instantClone()
     pcall(function() firesignal(tb.Activated) end)
     task.delay(0.55, function() _G.isCloning=false end)
 end
+_G.SXEInstantClone = instantClone -- exposed so the auto Clone-TP engine reuses the exact manual method
 
 -- DROP BRAINROT
 local _wfConns,_wfActive={},false
@@ -2209,7 +2990,8 @@ end
 
 player.CharacterAdded:Connect(function(newChar)
     task.wait(0.1)
-    if Config then Config.ClickToAP = false end
+    -- (Removed: Config.ClickToAP = false -- it disabled Click-to-AP on every
+    -- respawn, so it kept turning itself off while the toggle still showed on.)
     clearErrorOrb(); clearAllGhosts(); lagbackCallCount = 0
     pcall(function() for _, c in pairs(Workspace.CurrentCamera:GetChildren()) do if c:IsA("BasePart") and c.Name == "HumanoidRootPart" then c:Destroy() end end end)
     if oldRoot then pcall(function() oldRoot:Destroy() end); oldRoot = nil end
@@ -2275,7 +3057,14 @@ task.spawn(function()
             local isStealing = player:GetAttribute("Stealing")
             if isStealing and not wasStealingForInvis then
                 if not _G.invisibleStealEnabled and _G._forceInvisToggle then
-                    task.defer(function()
+                    task.spawn(function()
+                        -- Only enable invis after N seconds of CONTINUOUS holding
+                        -- of the brainrot (default 2s, tune via _G.SXEInvisHoldTime).
+                        local _h0 = os.clock()
+                        local _need = tonumber(_G.SXEInvisHoldTime) or 1.25
+                        while player:GetAttribute("Stealing") and (os.clock() - _h0) < _need do
+                            task.wait(0.05)
+                        end
                         if player:GetAttribute("Stealing") and not _G.invisibleStealEnabled then
                             pcall(_G._forceInvisToggle)
                             autoEnabledInvis = true
@@ -2332,7 +3121,7 @@ local function setWalkSpeedEnabled(en)
     end)
 end
 local function setWalkSpeedValue(v)
-    v = math.clamp(math.floor(v + 0.5), 15, 29)
+    v = math.clamp(math.floor(v + 0.5), 15, 50)
     WalkSpeedState.speed = v
     Config.WalkSpeedValue = v
     saveConfig()
@@ -2609,6 +3398,61 @@ player.CharacterAdded:Connect(function(char)
     end)
 end)
 
+
+-- =====================================================================
+-- ACCESSORY REMOVER  (event-driven -- deletes accessories as they appear)
+-- ---------------------------------------------------------------------
+-- Deletes accessories (yours + everyone else's) using SafeDestroy. EVENT-DRIVEN:
+-- strips a character once when it loads, then deletes any accessory the instant
+-- it's added -- no per-second polling loop (that caused little periodic freezes).
+-- Skips "Overhead" (nametag). Toggle: _G.SXEHideAccessories(false)/(true)
+-- =====================================================================
+do
+    local Players = game:GetService("Players")
+    local accOn = true
+
+    local ACC_CLASSES = {
+        "Accessory", "Hat", "HairAccessory", "FaceAccessory", "NeckAccessory",
+        "ShoulderAccessory", "FrontAccessory", "BackAccessory", "WaistAccessory",
+    }
+    local function isAccessory(obj)
+        for _, c in ipairs(ACC_CLASSES) do if obj:IsA(c) then return true end end
+        return false
+    end
+    local function safeDestroy(obj)
+        if obj.Name == "Overhead" then return end
+        pcall(function() obj:Destroy() end)
+    end
+
+    local function stripChar(char)
+        for _, obj in ipairs(char:GetChildren()) do
+            if isAccessory(obj) then safeDestroy(obj) end
+        end
+    end
+    local function watchChar(char)
+        if accOn then stripChar(char) end
+        char.ChildAdded:Connect(function(obj)
+            if accOn and isAccessory(obj) then task.defer(safeDestroy, obj) end
+        end)
+    end
+    local function watchPlayer(plr)
+        if plr.Character then watchChar(plr.Character) end
+        plr.CharacterAdded:Connect(watchChar)
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do watchPlayer(plr) end
+    Players.PlayerAdded:Connect(watchPlayer)
+
+    _G.SXEHideAccessories = function(v)
+        accOn = (v ~= false)
+        if accOn then
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr.Character then stripChar(plr.Character) end
+            end
+        end
+    end
+end
+
 local function isMyPlot_Instant(plotName)
     local plots = Workspace:FindFirstChild("Plots")
     if not plots then return false end
@@ -2622,7 +3466,7 @@ local function isMyPlot_Instant(plotName)
         local Packages = ReplicatedStorage:FindFirstChild("Packages")
         local Synchronizer = Packages and require(Packages:FindFirstChild("Synchronizer"))
         if Synchronizer then
-            local ch = Synchronizer:Get(plotName)
+            local ch = _G.SXE_GetPlotChannel(plotName)
             if ch then
                 local own = _G.sProp(ch, "Owner")
                 if own then
@@ -2754,7 +3598,7 @@ local function createProxAPRing()
     r.CastShadow = false
     r.Material = Enum.Material.Neon
     r.Transparency = 0.8
-    r.Color = Color3.fromRGB(232, 111, 177)
+    r.Color = Color3.fromRGB(30, 30, 30)
     local range = Config.ProximityRange or 15
     r.Size = Vector3.new(0.2, range*2, range*2)
     r.Parent = Workspace
@@ -2828,14 +3672,19 @@ task.spawn(function()
 end)
 
 -- AUTO RESET ON BALLOON / AUTO KICK ON STEAL / CLEAN ERRORS
-task.spawn(function() while true do task.wait(1); if not Config.AutoResetBalloon then continue end
-    for _,g in ipairs(playerGui:GetDescendants()) do local txt=(g:IsA("TextLabel") or g:IsA("TextButton")) and g.Text
-        if txt and string.find(txt,'ran "balloon" on you') then executeReset(true); break end end end end)
-
+-- Both are EVENT-BASED now. The balloon reset used to poll playerGui:GetDescendants()
+-- every 1s -- a full UI-tree walk + big array allocation that froze the frame once a
+-- second. It's folded into the same Text watcher as auto-kick, so it only fires when
+-- a label's text actually changes. No polling, no per-second freeze.
 task.spawn(function() local kw="you stole"; local hooked=setmetatable({},{__mode="k"})
+    local function checkText(t)
+        if Config.AutoKickOnSteal and string.find(string.lower(t),kw,1,true) then kickPlayer(t); return true end
+        if Config.AutoResetBalloon and string.find(t,'ran "balloon" on you',1,true) then pcall(executeReset, true) end
+        return false
+    end
     local function hookObj(obj) if hooked[obj] then return end; hooked[obj]=true
-        if Config.AutoKickOnSteal and string.find(string.lower(tostring(obj.Text or "")),kw,1,true) then kickPlayer(tostring(obj.Text or "")); return end
-        obj:GetPropertyChangedSignal("Text"):Connect(function() if Config.AutoKickOnSteal and string.find(string.lower(tostring(obj.Text or "")),kw,1,true) then kickPlayer(tostring(obj.Text or "")) end end)
+        if checkText(tostring(obj.Text or "")) then return end
+        obj:GetPropertyChangedSignal("Text"):Connect(function() checkText(tostring(obj.Text or "")) end)
     end
     local function watchRoot(root) for _,obj in ipairs(root:GetDescendants()) do if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then hookObj(obj) end end
         root.DescendantAdded:Connect(function(desc) if desc:IsA("TextLabel") or desc:IsA("TextButton") or desc:IsA("TextBox") then hookObj(desc) end end) end
@@ -2853,6 +3702,7 @@ local Packages = ReplicatedStorage:WaitForChild("Packages")
 local Datas = ReplicatedStorage:WaitForChild("Datas")
 local Synchronizer = require(Packages:WaitForChild("Synchronizer"))
 local AnimalsData = require(Datas:WaitForChild("Animals"))
+if _G.__LMARK then _G.__LMARK("core requires done") end
 
 autoStealEnabled = Config.AutoStealEnabled
 if autoStealEnabled == nil then autoStealEnabled = true end
@@ -3153,7 +4003,7 @@ function findProximityPromptForAnimal(animalData)
     if not plot then return nil end
     local podiums = plot:FindFirstChild("AnimalPodiums")
     if not podiums then return nil end
-    local ch = Synchronizer:Get(plot.Name)
+    local ch = _G.SXE_GetPlotChannel(plot.Name)
     if not ch then
         local podium = podiums:FindFirstChild(animalData.slot)
         if podium then
@@ -3173,7 +4023,7 @@ function findProximityPromptForAnimal(animalData)
         end
         return nil
     end
-    local al = ch:Get("AnimalList")
+    local al = _G.sProp(ch, "AnimalList")
     if not al then return nil end
     local brainrotName = (animalData.name and animalData.name:lower()) or ""
     local targetSlot = animalData.slot
@@ -3270,11 +4120,11 @@ local STEALBAR = {
     PANEL = Color3.fromRGB(15, 15, 15),
     TEXT = Color3.fromRGB(255, 255, 255),
     STROKE = Color3.fromRGB(60, 40, 55),
-    GLOW = Color3.fromRGB(232, 111, 177),
+    GLOW = Color3.fromRGB(30, 30, 30),
     TRACK = Color3.fromRGB(55, 40, 50),
     TRACK2 = Color3.fromRGB(35, 30, 35),
-    FILL1 = Color3.fromRGB(238, 98, 178),
-    FILL2 = Color3.fromRGB(232, 111, 177),
+    FILL1 = Color3.fromRGB(50, 50, 50),
+    FILL2 = Color3.fromRGB(30, 30, 30),
 }
 
 local mobileScale = UIS.TouchEnabled and 0.6 or 1
@@ -3738,13 +4588,28 @@ task.spawn(function()
     local ok4,Utils=pcall(function() return ReplicatedStorage:WaitForChild("Utils",5) end); if not ok4 or not Utils then return end
     local okS,Synchronizer=pcall(function() return require(Packages:WaitForChild("Synchronizer")) end); if not okS then return end
     local okA,AnimalsData=pcall(function() return require(Datas:WaitForChild("Animals")) end); if not okA then return end
-    local okAS,AnimalsShared=pcall(function() return require(Shared:WaitForChild("Animals")) end); if not okAS then return end
+    local AnimalsShared=_G._xenAnimShim
     local okN,NumberUtils=pcall(function() return require(Utils:WaitForChild("NumberUtils")) end); if not okN then return end
     local allAnimalsCache={}; local lastAnimalData={}
-    local function getAnimalHash(al) if not al then return "" end; local h=""; for slot,d in pairs(al) do if type(d)=="table" then h=h..tostring(slot)..tostring(d.Index)..tostring(d.Mutation) end end; return h end
+    -- Low-GC hash: the old `h = h .. ...` rope allocated a new full-length string
+    -- every iteration (O(n^2) garbage) and ran on every plot scan -> steady GC
+    -- pressure = periodic ~0.1s hitches. table.concat allocates once instead.
+    local function getAnimalHash(al)
+        if not al then return "" end
+        local parts, n = {}, 0
+        for slot,d in pairs(al) do
+            if type(d)=="table" then
+                n=n+1; parts[n]=tostring(slot).."|"..tostring(d.Index).."|"..tostring(d.Mutation)
+            end
+        end
+        return table.concat(parts, ";")
+    end
     local function scanSinglePlot(plot) pcall(function()
-        local ch=Synchronizer:Get(plot.Name); if not ch then return end
-        local al=ch:Get("AnimalList"); local owner=ch:Get("Owner")
+        local ch=_G.SXE_GetPlotChannel(plot.Name); if not ch then return end
+        -- Read via sProp (direct CacheTable rawget), NOT ch:Get() -- the game
+        -- update added heavy anti-exploit overhead to the channel :Get method, and
+        -- this runs every 0.5s per plot, which is what was tanking FPS.
+        local al=_G.sProp(ch,"AnimalList"); local owner=_G.sProp(ch,"Owner")
         if not owner or not owner.Name or not Players:FindFirstChild(owner.Name) then
             lastAnimalData[plot.Name]=nil; for i=#allAnimalsCache,1,-1 do if allAnimalsCache[i].plot==plot.Name then table.remove(allAnimalsCache,i) end end; return end
         if not al then lastAnimalData[plot.Name]=nil; for i=#allAnimalsCache,1,-1 do if allAnimalsCache[i].plot==plot.Name then table.remove(allAnimalsCache,i) end end; return end
@@ -3773,18 +4638,27 @@ task.spawn(function()
     -- 0.5s periodic rescan; scanSinglePlot is hash-gated, so it's a cheap no-op
     -- whenever a plot's AnimalList hasn't changed. retries softened (40 @ 0.07s)
     -- so the channel wait doesn't spin tight during load.
-    local function setupPlotListener(plot) local ch; local retries=0
-        while not ch and retries<40 do local ok,r=pcall(function() return Synchronizer:Get(plot.Name) end); if ok and r then ch=r; break else retries=retries+1; task.wait(0.07) end end
-        if not ch then return end; scanSinglePlot(plot)
+    local function setupPlotListener(plot, phase) local ch; local retries=0
+        while not ch and retries<40 do local ok,r=pcall(function() return _G.SXE_GetPlotChannel(plot.Name) end); if ok and r then ch=r; break else retries=retries+1; task.wait(0.07) end end
+        if not ch then return end
+        -- STAGGER: offset each plot's scan phase so they do NOT all scan on the same
+        -- frame. Every plot's loop starting together meant all ~8 scanSinglePlot
+        -- calls landed in one frame every 0.5s -- that synchronized burst was the
+        -- recurring ~0.5s FPS spike. Spreading the phases across the interval turns
+        -- one heavy frame into cheap slices across many frames.
+        if phase and phase > 0 then task.wait(phase) end
+        scanSinglePlot(plot)
         task.spawn(function() while plot.Parent do task.wait(0.5); scanSinglePlot(plot) end end)
     end
     local plots=Workspace:WaitForChild("Plots",8)
     if plots then
-        for _,p in ipairs(plots:GetChildren()) do
-            task.spawn(setupPlotListener, p)
+        local kids = plots:GetChildren()
+        local n = #kids
+        for i,p in ipairs(kids) do
+            task.spawn(setupPlotListener, p, (n > 0) and ((i - 1) * (0.5 / n)) or 0)
         end
         SharedState.InitialScanComplete=true
-        plots.ChildAdded:Connect(function(p) task.wait(0.5); task.spawn(setupPlotListener, p) end)
+        plots.ChildAdded:Connect(function(p) task.wait(0.5 + math.random() * 0.5); task.spawn(setupPlotListener, p, math.random() * 0.5) end)
         plots.ChildRemoved:Connect(function(p) lastAnimalData[p.Name]=nil; for i=#allAnimalsCache,1,-1 do if allAnimalsCache[i].plot==p.Name then table.remove(allAnimalsCache,i) end end; SharedState.ListNeedsRedraw=true end)
     end
     task.spawn(function() while true do SharedState.AllAnimalsCache=allAnimalsCache; task.wait(0.5) end end)
@@ -3795,7 +4669,17 @@ player:GetAttributeChangedSignal("Stealing"):Connect(function()
     local isStealing=(player:GetAttribute("Stealing")==true)
     if FloatState.active and not isStealing then setFloat(false) end
     if _G.AutoInvisDuringSteal then
-        if isStealing and not _G.invisibleStealEnabled and _G._forceInvisToggle then task.defer(function() if player:GetAttribute("Stealing") and not _G.invisibleStealEnabled then pcall(_G._forceInvisToggle) end end)
+        if isStealing and not _G.invisibleStealEnabled and _G._forceInvisToggle then
+            task.spawn(function()
+                -- Only enable invis after N seconds of CONTINUOUS holding (default
+                -- 2s, tune via _G.SXEInvisHoldTime).
+                local _h0 = os.clock()
+                local _need = tonumber(_G.SXEInvisHoldTime) or 1.25
+                while player:GetAttribute("Stealing") and (os.clock() - _h0) < _need do
+                    task.wait(0.05)
+                end
+                if player:GetAttribute("Stealing") and not _G.invisibleStealEnabled then pcall(_G._forceInvisToggle) end
+            end)
         elseif not isStealing and _G.invisibleStealEnabled and _G._forceInvisToggle then task.wait(0.3); if not player:GetAttribute("Stealing") then pcall(_G._forceInvisToggle) end end
     end
     if isStealing and Config.AutoUnlockOnSteal then
@@ -4112,47 +4996,47 @@ function flyForwardTo(hrp, tpPos, lookDir, targetY, customSpeed)
                     targetFloorY = (tpPos.Y + 3.5) + (targetY - tpPos.Y) * t
                 end
             end
-            -- Multi-Ray Collision Detection (Feet, Torso, and Head levels)
-            local heightsToCheck = {-3, 0, 3}
-            local isRealObstacle = false
-            for _, heightOffset in ipairs(heightsToCheck) do
-                local rayOrigin = myPos + Vector3.new(0, heightOffset, 0)
-                local rayFwd = Workspace:Raycast(rayOrigin, moveDir * FLY_RAY_DIST, flyRayParams)
-                if rayFwd then
-                    local part = rayFwd.Instance
-                    if part and part.CanCollide then
-                        local topY = part.Position.Y + (part.Size.Y / 2)
-                        -- Only fly over if the obstacle's top is significantly higher than flat ground (more than 5 studs)
-                        if (topY - tpPos.Y) > 5 then
-                            isRealObstacle = true
-                            break -- Tall obstacle detected, stop checking other heights
-                        end
+
+            -- Ballistic arc: climb to cruise altitude that clears typical two-floor
+            -- base walls (~30 studs), hold it over the obstacle, then descend into
+            -- the target. The old code only rose when a wall was ~20 studs away —
+            -- too late to clear it at 160 studs/sec cruise, so the character just
+            -- slammed into walls.
+            local CRUISE_ALT   = tpPos.Y + 35   -- well above roof height of a full 2-floor base
+            local DESCEND_DIST = 25             -- start descent when this close (X/Z) to target
+            local LOOKAHEAD    = 80             -- scan this far ahead for tall obstacles
+
+            -- Long-range multi-height scan for tall obstacles in the path
+            local hasTallObstacleAhead = false
+            for _, hoff in ipairs({-3, 0, 3, 8}) do
+                local rayFwd = Workspace:Raycast(myPos + Vector3.new(0, hoff, 0), moveDir * LOOKAHEAD, flyRayParams)
+                if rayFwd and rayFwd.Instance and rayFwd.Instance.CanCollide then
+                    local topY = rayFwd.Instance.Position.Y + (rayFwd.Instance.Size.Y / 2)
+                    if (topY - tpPos.Y) > 5 then
+                        hasTallObstacleAhead = true
+                        break
                     end
                 end
             end
 
-            if isRealObstacle then
-                -- If tall obstacle detected, rise up and fly over it
-                yVel = FLY_RISE_SPEED
-            else
-                -- Check if there is a real tall obstacle underneath us
-                local rayDown = Workspace:Raycast(myPos, Vector3.new(0, -15, 0), flyRayParams)
-                local obstacleUnderneath = false
-                if rayDown then
-                    local hitY = rayDown.Position.Y
-                    if hitY > (tpPos.Y + 4) then
-                        obstacleUnderneath = true
-                    end
-                end
-
-                if obstacleUnderneath then
-                    -- Keep current altitude while flying over the obstacle
-                    yVel = 0
+            if flatDist > DESCEND_DIST and (hasTallObstacleAhead or myPos.Y < CRUISE_ALT - 5) then
+                -- Climb/cruise phase: rise until at cruise altitude, then hold it
+                if myPos.Y < CRUISE_ALT then
+                    yVel = FLY_RISE_SPEED
                 else
-                    -- No real obstacle in front or underneath, instantly stick to the ground
-                    hrp.CFrame = CFrame.new(hrp.Position.X, targetFloorY, hrp.Position.Z) * (hrp.CFrame - hrp.CFrame.Position)
                     yVel = 0
                 end
+            elseif flatDist <= DESCEND_DIST then
+                -- Descent phase: pull down toward the target ground level
+                yVel = math.clamp((targetFloorY - myPos.Y) * 4, -150, 0)
+            elseif myPos.Y > targetFloorY + 5 then
+                -- Coasting mid-arc with no obstacle ahead — hold altitude, no snap
+                yVel = 0
+            else
+                -- Already low and nothing tall ahead — snap to target ground so
+                -- gravity/carpet don't drift us down into terrain
+                hrp.CFrame = CFrame.new(hrp.Position.X, targetFloorY, hrp.Position.Z) * (hrp.CFrame - hrp.CFrame.Position)
+                yVel = 0
             end
         else
             -- Normal rise/fall behavior for second floor
@@ -4384,10 +5268,11 @@ do
             _revive(hum)
         end)
         local _lastHarden = 0
+local _lastHarden = 0
         _hbConn = RunService.Heartbeat:Connect(function()
             if _G.AntiDieDisabled or not hum or not hum.Parent then return end
             local now = os.clock()
-            if now - _lastHarden >= 0.5 then _lastHarden = now; _harden(hum) end
+            if now - _lastHarden >= 1 then _lastHarden = now; _harden(hum) end
             if hum.Health <= 0 then _revive(hum) end
             local state = hum:GetState()
             if state == Enum.HumanoidStateType.Dead or state == Enum.HumanoidStateType.Ragdoll
@@ -4406,37 +5291,6 @@ do
 end
 
 -- =====================================================================
--- Synchronizer detection bypass
--- =====================================================================
-do
-    local okReq, syn = pcall(require, RS:FindFirstChild("Packages"):FindFirstChild("Synchronizer"))
-    if okReq and typeof(syn) == "table" then
-        local function HasBoolUpvalue(Fn)
-            local OkU, Ups = xpcall(debug.getupvalues, function() end, Fn)
-            if not OkU then return false end
-            for _, V in pairs(Ups) do
-                if typeof(V) == "boolean" then return true end
-            end
-            return false
-        end
-        for _, Fn in pairs(syn) do
-            if typeof(Fn) == "function" and not isexecutorclosure(Fn) then
-                local OkU, Ups = xpcall(debug.getupvalues, function() end, Fn)
-                if OkU then
-                    for Idx, V in pairs(Ups) do
-                        if typeof(V) == "function" and not isexecutorclosure(V) and HasBoolUpvalue(V) then
-                            pcall(debug.setupvalue, Fn, Idx, newcclosure(function() end))
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-
-
--- =====================================================================
 -- Module loaders
 -- =====================================================================
 local Synchronizer, AnimalsData, AnimalsShared, NumberUtils
@@ -4450,7 +5304,7 @@ local function loadModules()
         local Utils = RS:WaitForChild("Utils", 5)
         Synchronizer = require(Packages:WaitForChild("Synchronizer"))
         AnimalsData = require(Datas:WaitForChild("Animals"))
-        AnimalsShared = require(Shared:WaitForChild("Animals"))
+        AnimalsShared = _G._xenAnimShim
         NumberUtils = require(Utils:WaitForChild("NumberUtils"))
     end)
     return ok and Synchronizer ~= nil
@@ -4460,7 +5314,7 @@ local NetModule
 local function loadNet()
     if NetModule then return true end
     local ok, mod = pcall(function()
-        return require(RS:WaitForChild("Packages", 5):WaitForChild("Net", 5):FindFirstChildWhichIsA("ModuleScript", true))
+        return _G.Net
     end)
     if not ok or type(mod) ~= "table" then return false end
     NetModule = mod
@@ -4515,7 +5369,9 @@ local function fireGrapple()
         if tool and hum then pcall(function() hum:EquipTool(tool) end) end
     end
     if not char:FindFirstChild("Grapple Hook") then return end
-    pcall(function() NetModule:RemoteEvent("UseItem"):FireServer(2) end)
+    -- Fire the live hashed RE/UseItem with a far-grapple float (resolver tracks
+    -- the per-join hash rotation; old GetRemote returned the dead alias).
+    if _G.SXEFireGrapple2 then pcall(_G.SXEFireGrapple2) end
 end
 
 local function carpetEngage()
@@ -4525,11 +5381,11 @@ local function carpetEngage()
     if not char or not hum then return nil end
     local g = findTool("Grapple Hook")
     if g then
-        if g.Parent ~= char then 
+        if g.Parent ~= char then
             pcall(function() hum:EquipTool(g) end)
             task.wait(0.05) -- Let tool equip register
         end
-        if NetModule then pcall(function() NetModule:RemoteEvent("UseItem"):FireServer(2) end) end
+        if _G.SXEFireGrapple2 then pcall(_G.SXEFireGrapple2) end
         task.wait(0.22) -- Let grapple projectile register and pull
     end
     pcall(function() hum:UnequipTools() end)
@@ -4657,9 +5513,28 @@ end
 local function getPlotChannel(plotName)
     if not Synchronizer then return nil end
     local channel
-    pcall(function() channel = Synchronizer:Get(plotName) end)
-    if not channel then pcall(function() channel = Synchronizer:Wait(plotName) end) end
+    pcall(function() channel = _G.SXE_GetPlotChannel(plotName) end)
+    if not channel then local _t0=os.clock() repeat channel=_G.XenSyncGet(plotName) if channel then break end task.wait(0.05) until os.clock()-_t0>3 end
     return channel
+end
+
+-- _G.sProp was USED here (and at the plot-owner check further up) but never
+-- defined anywhere in this script -- so every call errored and this scanner
+-- read nothing. Define it: read the channel's CacheTable directly via rawget
+-- (light, and never touches the hookable channel:Get), falling back to the
+-- method call only on a miss.
+if type(_G.sProp) ~= "function" then
+    _G.sProp = function(ch, key)
+        if not ch or key == nil then return nil end
+        local v
+        pcall(function()
+            local ct = rawget(ch, "CacheTable")
+            if type(ct) == "table" then v = ct[key] end
+        end)
+        if v ~= nil then return v end
+        pcall(function() if type(ch.Get) == "function" then v = ch:Get(key) end end)
+        return v
+    end
 end
 
 local function channelGet(channel, key)
@@ -4817,6 +5692,7 @@ end
 -- =====================================================================
 local _vizParts = {}
 local function clearViz()
+    _G.__vizGen = (_G.__vizGen or 0) + 1
     for _, p in ipairs(_vizParts) do if p and p.Parent then p:Destroy() end end
     table.clear(_vizParts)
 end
@@ -4841,8 +5717,20 @@ local function vizDot(pos, color, sz)
     _vizParts[#_vizParts + 1] = p
 end
 local function vizPath(fromPos, waypoints)
-    -- Pathfinder lines/dots disabled (user request: no lines).
-    return
+    -- Draw the TP route: a dot at each waypoint + neon lines connecting them.
+    -- Toggle off with _G.SXEShowTPPath = false.
+    if _G.SXEShowTPPath == false then return end
+    if not fromPos or not waypoints or #waypoints == 0 then return end
+    clearViz()
+    local LINE = Color3.fromRGB(0, 200, 255)   -- cyan connectors
+    local DOT  = Color3.fromRGB(255, 255, 0)    -- all dots one color (yellow)
+    vizDot(fromPos, DOT, 1.5)
+    local prev = fromPos
+    for _, wp in ipairs(waypoints) do
+        vizLine(prev, wp, LINE)
+        vizDot(wp, DOT, 1.5)
+        prev = wp
+    end
 end
 
 local isGrabbleTeleporting = false
@@ -4872,6 +5760,7 @@ local function velMoveThrough(hrp, waypoints, speedOverride, allowJump, quickSta
     if not hrp or not hrp.Parent or #waypoints == 0 then return end
     local _runSpeed = speedOverride or Config.TpSettings.GrabbleTPSpeed or (_G.SXECarpetSpeed or CARPET_SPEED or 230)
     vizPath(hrp.Position, waypoints)
+    local _myVizGen = _G.__vizGen
     local wpIdx = 1
     local done = false
     local conn
@@ -4885,7 +5774,11 @@ local function velMoveThrough(hrp, waypoints, speedOverride, allowJump, quickSta
             hrp.CFrame = CFrame.new(waypoints[#waypoints]) * CFrame.Angles(0, y, 0)
         end
         if conn then conn:Disconnect() end
-        clearViz()
+        -- Keep the drawn path visible briefly after arrival (fast TPs would
+        -- otherwise flash by), but only clear if no newer path replaced it.
+        task.delay(tonumber(_G.SXETPPathLinger) or 1.5, function()
+            if _G.__vizGen == _myVizGen then clearViz() end
+        end)
     end
     local lastDist, stall = math.huge, 0
 
@@ -5146,27 +6039,39 @@ end
 -- =====================================================================
 
 function getPetPosition(plot, slot)
-    local podiums = plot:FindFirstChild("AnimalPodiums")
-    if not podiums then return nil end
-    local podium = podiums:FindFirstChild(tostring(slot))
-    if not podium then return nil end
-
-    for _, desc in ipairs(podium:GetDescendants()) do
-        if desc:IsA("Model") and desc.Name ~= "Claim" and desc.Name ~= "Base" and desc.Name ~= "Decorations" then
-            local hasMesh = false
-            for _, c in ipairs(desc:GetDescendants()) do
-                if c:IsA("MeshPart") then hasMesh = true; break end
-            end
-            if hasMesh then
-                local ok, cf = pcall(function() return desc:GetBoundingBox() end)
-                if ok then return cf.Position end
+    -- 5s position cache: the nested GetDescendants + GetBoundingBox is the single
+    -- heaviest part of scanning (it ran every scan, up to 10x/s, per pet). Podium
+    -- pets don't move, so caching this per slot is the big FPS win on load.
+    _G.__PetPosCache = _G.__PetPosCache or {}
+    local _cache = _G.__PetPosCache
+    local _key = plot.Name .. "|" .. tostring(slot)
+    local _hit = _cache[_key]
+    local _now = os.clock()
+    if _hit and _now < _hit.exp then return _hit.pos end
+    local function compute()
+        local podiums = plot:FindFirstChild("AnimalPodiums")
+        if not podiums then return nil end
+        local podium = podiums:FindFirstChild(tostring(slot))
+        if not podium then return nil end
+        for _, desc in ipairs(podium:GetDescendants()) do
+            if desc:IsA("Model") and desc.Name ~= "Claim" and desc.Name ~= "Base" and desc.Name ~= "Decorations" then
+                local hasMesh = false
+                for _, c in ipairs(desc:GetDescendants()) do
+                    if c:IsA("MeshPart") then hasMesh = true; break end
+                end
+                if hasMesh then
+                    local ok, cf = pcall(function() return desc:GetBoundingBox() end)
+                    if ok then return cf.Position end
+                end
             end
         end
+        local ok, cf = pcall(function() return podium:GetPivot() end)
+        if ok then return cf.Position end
+        return podium.Position
     end
-
-    local ok, cf = pcall(function() return podium:GetPivot() end)
-    if ok then return cf.Position end
-    return podium.Position
+    local _pos = compute()
+    if _pos then _cache[_key] = { pos = _pos, exp = _now + 12 + math.random() * 8 } end
+    return _pos
 end
 
 end
@@ -5196,7 +6101,7 @@ end
 task.spawn(function()
     while true do
         pcall(Strip)
-        task.wait(0.5)
+        task.wait(2)
     end
 end)
 
@@ -5228,7 +6133,7 @@ function runAutoSnipe()
     if not hrp or not hum or (hum.Health <= 0) then
         return
     end
-    local lastFpsCap = pcall(getfpscap) and getfpscap() or 60
+    local lastFpsCap = pcall(getfpscap) and getfpscap() or 999
     pcall(setfpscap, 200)
     -- (Old Grabble TP branch removed - now handled by SXE Clone-TP router above.)
     _G._isTpMoving = true
@@ -5258,9 +6163,15 @@ function runAutoSnipe()
         local carpet = LocalPlayer.Backpack:FindFirstChild(carpetName) or char:FindFirstChild(carpetName)
         local cloner = LocalPlayer.Backpack:FindFirstChild("Quantum Cloner") or char:FindFirstChild("Quantum Cloner")
         equipTpToolAndWait(hum)
+        -- Treat every floor the same: rise to brainrot height outside, clone push
+        -- through the wall at that height, platform under player during steal.
+        -- isSecondFloor is kept for the rise height calculation only.
         local isSecondFloor = exactPos.Y > 10
+        -- V3 F2 from F1: for 2nd-floor brainrots, approach from floor 1 (clone-push
+        -- through the ground-floor wall, then platform up to brainrot from below).
+        local f2FromF1 = Config.AutoTPFloor2FromFloor1 and isSecondFloor
         local isCloseBase = false
-        
+
         local signPart = getClosestBaseSign(targetPart)
             if not signPart then
                 error("signPart nil")
@@ -5275,39 +6186,28 @@ function runAutoSnipe()
                 error("normal tp MED point nil")
             end
             hrp.AssemblyLinearVelocity = Vector3.zero
-            local tpPos
-            if exactPos.Y <= 6.313370704650879 then
-                local frontPoint = signPart.Position + (FORWARD * 20)
-                local backPoint = signPart.Position + (BACK * 20)
-                local myPos = hrp.Position
-                local distFront = (Vector3.new(frontPoint.X, 0, frontPoint.Z) - Vector3.new(myPos.X, 0, myPos.Z)).Magnitude
-                local distBack = (Vector3.new(backPoint.X, 0, backPoint.Z) - Vector3.new(myPos.X, 0, myPos.Z)).Magnitude
-                local chosen = ((distFront < distBack) and frontPoint) or backPoint
-                tpPos = Vector3.new(chosen.X, -4.8, chosen.Z)
-            else
-                local backPoint = signPart.Position + (BACK * 20)
-                local frontPoint = signPart.Position + (FORWARD * 20)
-                local myPos = hrp.Position
-                local myFlat = Vector3.new(myPos.X, 0, myPos.Z)
-                local distBack = (Vector3.new(backPoint.X, 0, backPoint.Z) - myFlat).Magnitude
-                local distFront = (Vector3.new(frontPoint.X, 0, frontPoint.Z) - myFlat).Magnitude
-                local chosen = ((distBack < distFront) and backPoint) or frontPoint
-                -- Always ground level Y
-                tpPos = Vector3.new(chosen.X, -4.8, chosen.Z)
-            end
+
+            -- Pick the closer side of the base sign, always at ground level first
+            local frontPoint = signPart.Position + (FORWARD * 20)
+            local backPoint  = signPart.Position + (BACK * 20)
+            local myFlat     = Vector3.new(hrp.Position.X, 0, hrp.Position.Z)
+            local distFront  = (Vector3.new(frontPoint.X, 0, frontPoint.Z) - myFlat).Magnitude
+            local distBack   = (Vector3.new(backPoint.X, 0, backPoint.Z) - myFlat).Magnitude
+            local chosen     = (distFront < distBack) and frontPoint or backPoint
+            local tpPos      = Vector3.new(chosen.X, -4.8, chosen.Z)
+
             local initialDist = (hrp.Position - tpPos).Magnitude
-            isCloseBase = (initialDist <= 100) and isSecondFloor
+            isCloseBase = initialDist <= 100
+
+            -- Step 1: move to the outside position at ground level
             if Config.TpSettings.FlyTP then
-                -- Fly directly to the target base position (tpPos) facing LEFT, with obstacle avoidance
-                flyForwardTo(hrp, tpPos, LEFT, isSecondFloor and (signPart.Position.Y + 4) or nil, isCloseBase and (Config.TpSettings.FlyTPCloseSpeed or 75) or nil)
+                flyForwardTo(hrp, tpPos, LEFT, nil, isCloseBase and (Config.TpSettings.FlyTPCloseSpeed or 75) or nil)
             else
-                -- Teleport directly to the target base position (tpPos) facing LEFT
                 if hum and hum.Parent then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
                 task.wait(0.01)
                 hrp.AssemblyLinearVelocity = Vector3.zero
                 local targetCF = CFrame.lookAt(tpPos, tpPos + LEFT)
                 if isCloseBase then
-                    -- Smooth CFrame glide to close bases to bypass anti-cheat flags
                     local startCF = hrp.CFrame
                     local duration = 2.5
                     local start = tick()
@@ -5327,126 +6227,121 @@ function runAutoSnipe()
             end, 0.5)
             task.wait(0.05)
 
-            if isSecondFloor and hrp.Position.Y < (signPart.Position.Y + 2) then
-                -- Smooth and slow fly up at a safe distance (tpPos is 15-20 studs away)
-                local startY = hrp.Position.Y
-                local targetY = signPart.Position.Y + 4
-                local riseTime = isCloseBase and 5.0 or 1.2
-                local elapsed = 0
+            -- Step 2: rise to brainrot height outside the wall.
+            -- First floor rises to brainrot Y + 1 (enough to be level with it).
+            -- Second floor rises to signPart.Y + 4 (same as before).
+            -- F2 from F1: stay low at ground-floor wall height so we clone-push
+            -- through the 1st-floor wall; the final positioning block then lifts
+            -- us up to the 2nd-floor brainrot with a platform underneath.
+            local riseTargetY
+            if f2FromF1 then
+                riseTargetY = signPart.Position.Y + 3
+            elseif isSecondFloor then
+                riseTargetY = signPart.Position.Y + 4
+            else
+                riseTargetY = exactPos.Y + 1
+            end
+
+            if hrp.Position.Y < (riseTargetY - 0.5) then
+                local startY    = hrp.Position.Y
+                local riseTime  = isCloseBase and 5.0 or 1.2
+                local elapsed   = 0
                 while elapsed < riseTime and hrp.Parent do
                     elapsed = elapsed + RunService.Heartbeat:Wait()
                     local t = math.min(elapsed / riseTime, 1)
-                    local currentY = startY + (targetY - startY) * t
-                    hrp.CFrame = CFrame.lookAt(Vector3.new(tpPos.X, currentY, tpPos.Z), Vector3.new(tpPos.X, currentY, tpPos.Z) + LEFT)
+                    local currentY = startY + (riseTargetY - startY) * t
+                    hrp.CFrame = CFrame.lookAt(
+                        Vector3.new(tpPos.X, currentY, tpPos.Z),
+                        Vector3.new(tpPos.X, currentY, tpPos.Z) + LEFT)
                     hrp.AssemblyLinearVelocity = Vector3.zero
                 end
-                hrp.CFrame = CFrame.lookAt(Vector3.new(tpPos.X, targetY, tpPos.Z), Vector3.new(tpPos.X, targetY, tpPos.Z) + LEFT)
+                hrp.CFrame = CFrame.lookAt(
+                    Vector3.new(tpPos.X, riseTargetY, tpPos.Z),
+                    Vector3.new(tpPos.X, riseTargetY, tpPos.Z) + LEFT)
                 hrp.AssemblyLinearVelocity = Vector3.zero
             end
-            if isSecondFloor or not _G._isTargetPlotUnlocked(targetPetData.plot) then
-                prepMiniTpTool(hum, hrp)
-                waitSecondsHeartbeat(0.05)
-                if isSecondFloor then
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    waitSecondsHeartbeat(0.01)
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    hrp.CFrame = hrp.CFrame * CFrame.new(0, 0, -2.5)
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                else
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    waitSecondsHeartbeat(0.03)
-                    walkForward(0.1)
-                end
-                waitSecondsHeartbeat(Config.TpSettings.CloneDelayVal or 0.1)
-                local miniPos = hrp.Position
-                waitSecondsHeartbeat(0.01)
-                local stillAtMiniPos = waitUntilHeartbeat(function()
-                    return hrp and hrp.Parent and ((hrp.Position - miniPos).Magnitude <= 2)
-                end, 0.75)
-                if not stillAtMiniPos then
-                    error("moved away from mini TP position before clone")
-                end
-                hrp.AssemblyLinearVelocity = Vector3.zero
-                hrp.AssemblyAngularVelocity = Vector3.zero
-                local cloneSuccess = false
-                for attempt = 1, 3 do
-                    instantClone()
-                    local moved = waitUntilHeartbeat(function()
-                        return hrp and hrp.Parent and ((hrp.Position - miniPos).Magnitude >= 0.35)
-                    end, 3)
-                    if moved then
-                        cloneSuccess = true
-                        break
-                    end
-                    while _G.isCloning do
-                        task.wait()
-                    end
-                    task.wait(0.1)
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    hrp.CFrame = CFrame.new(miniPos)
-                end
-                if not cloneSuccess then
-                    error("clone failed/no push")
-                end
-                if cloner then
-                    hum:EquipTool(cloner)
-                    task.wait(0.02)
-                    pcall(function()
-                        cloner:Activate()
-                    end)
-                    task.wait(0.05)
-                    equipTpToolAndWait(hum)
-                end
+
+            -- Step 3: clone push through the wall at brainrot height (all floors)
+            prepMiniTpTool(hum, hrp)
+            waitSecondsHeartbeat(0.05)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            waitSecondsHeartbeat(0.01)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.CFrame = hrp.CFrame * CFrame.new(0, 0, -2.5)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            waitSecondsHeartbeat(Config.TpSettings.CloneDelayVal or 0.1)
+            local miniPos = hrp.Position
+            waitSecondsHeartbeat(0.01)
+            local stillAtMiniPos = waitUntilHeartbeat(function()
+                return hrp and hrp.Parent and ((hrp.Position - miniPos).Magnitude <= 2)
+            end, 0.75)
+            if not stillAtMiniPos then
+                error("moved away from mini TP position before clone")
             end
-            
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            local cloneSuccess = false
+            for attempt = 1, 3 do
+                instantClone()
+                local moved = waitUntilHeartbeat(function()
+                    return hrp and hrp.Parent and ((hrp.Position - miniPos).Magnitude >= 0.35)
+                end, 3)
+                if moved then
+                    cloneSuccess = true
+                    break
+                end
+                while _G.isCloning do task.wait() end
+                task.wait(0.1)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.CFrame = CFrame.new(miniPos)
+            end
+            if not cloneSuccess then
+                error("clone failed/no push")
+            end
+            if cloner then
+                hum:EquipTool(cloner)
+                task.wait(0.02)
+                pcall(function() cloner:Activate() end)
+                task.wait(0.05)
+                equipTpToolAndWait(hum)
+            end
+
             -- Keep velocity zero and CFrame glued to target animal for steal duration
             local holdEnd = tick() + math.max(0.18, Config.TpSettings.DelayVal or 0.4)
             while tick() < holdEnd do
-                if not hrp.Parent then
-                    break
-                end
-                if LocalPlayer:GetAttribute("Stealing") then
-                    break
-                end
+                if not hrp.Parent then break end
+                if LocalPlayer:GetAttribute("Stealing") then break end
                 hrp.AssemblyLinearVelocity = Vector3.zero
                 hrp.AssemblyAngularVelocity = Vector3.zero
-                pcall(function()
-                    hrp.CFrame = CFrame.new(targetPart.Position)
-                end)
+                pcall(function() hrp.CFrame = CFrame.new(targetPart.Position) end)
                 RunService.Heartbeat:Wait()
             end
-            
-            -- Post-steal stabilization / platform fallback
-            if isSecondFloor then
-                local plat = Instance.new("Part")
-                plat.Name = "XiTempPlatform"
-                plat.Size = Vector3.new(6, 1.5, 6)
-                plat.Position = Vector3.new(hrp.Position.X, hrp.Position.Y - 5.5, hrp.Position.Z)
-                plat.Color = Color3.fromRGB(232, 111, 177)
-                plat.Material = Enum.Material.Neon
-                plat.Anchored = true
-                plat.CanCollide = false; pcall(makeOneWay, plat)
-                plat.Transparency = 0.3
-                plat.Parent = Workspace
-                task.spawn(function()
-                    local start = tick()
-                    while (tick() - start) < 20 do
-                        if LocalPlayer:GetAttribute("Stealing") then break end
-                        task.wait(0.1)
-                    end
-                    plat:Destroy()
-                end)
-            else
-                for i = 1, 5 do
-                    if LocalPlayer:GetAttribute("Stealing") then break end
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    if (hrp.Position - targetPart.Position).Magnitude > 3 then
-                        hrp.CFrame = CFrame.new(targetPart.Position)
-                    end
-                    task.wait(0.05)
+
+            -- Step 4: platform under player (all floors) so we don't fall during steal
+            local plat = Instance.new("Part")
+            plat.Name = "XiTempPlatform"
+            plat.Size = Vector3.new(6, 1.5, 6)
+            plat.Position = Vector3.new(hrp.Position.X, hrp.Position.Y - 3.5, hrp.Position.Z)
+            plat.Color = Color3.fromRGB(30, 30, 30)
+            plat.Material = Enum.Material.Neon
+            plat.Anchored = true
+            plat.CanCollide = false; pcall(makeOneWay, plat)
+            plat.Transparency = 0.3
+            plat.Parent = Workspace
+            local platConn = RunService.Heartbeat:Connect(function()
+                if plat and plat.Parent and hrp and hrp.Parent then
+                    plat.Position = Vector3.new(hrp.Position.X, hrp.Position.Y - 3.5, hrp.Position.Z)
                 end
-            end
+            end)
+            task.spawn(function()
+                local s = tick()
+                while (tick() - s) < 20 do
+                    if LocalPlayer:GetAttribute("Stealing") then break end
+                    task.wait(0.1)
+                end
+                pcall(function() platConn:Disconnect() end)
+                if plat and plat.Parent then plat:Destroy() end
+            end)
         -- Force equip the configured TP tool (not the cloner)
         pcall(function() hum:UnequipTools() end)
         task.wait(0.05)
@@ -5490,14 +6385,19 @@ function runAutoSnipe()
                 local flatDist = diff.Magnitude
                 
                 local verticalDiff = brPos.Y - hrp.Position.Y
-                if flatDist < 3 and math.abs(verticalDiff) < 8 then break end
+                -- When f2FromF1 is on, break as soon as we're horizontally close;
+                -- the airPos+platform block below handles the vertical lift.
+                if flatDist < 3 and (f2FromF1 or math.abs(verticalDiff) < 8) then break end
                 
                 local moveDir = (flatDist > 0.1) and diff.Unit or Vector3.zero
                 local yVel = hrp.AssemblyLinearVelocity.Y
                 
-                -- Handle vertical: if brainrot is above, rise up smoothly
+                -- Handle vertical: if brainrot is above, rise up smoothly.
+                -- Skip the rise when f2FromF1 is on so we stay on floor 1.
                 if verticalDiff > 2 then
-                    yVel = math.clamp(verticalDiff * 7, 30, 60)
+                    if not f2FromF1 then
+                        yVel = math.clamp(verticalDiff * 7, 30, 60)
+                    end
                 elseif verticalDiff < -2 then
                     yVel = math.clamp(verticalDiff * 4, -80, 0)
                 end
@@ -5519,7 +6419,7 @@ function runAutoSnipe()
             plat.Name = "XiTempPlatform"
             plat.Size = Vector3.new(6, 1.5, 6)
             plat.Position = airPos - Vector3.new(0, 3, 0)
-            plat.Color = Color3.fromRGB(232, 111, 177)
+            plat.Color = Color3.fromRGB(30, 30, 30)
             plat.Material = Enum.Material.Neon
             plat.Anchored = true
             plat.CanCollide = false; pcall(makeOneWay, plat)
@@ -5557,6 +6457,22 @@ function runAutoSnipe()
                     hrp.CFrame = CFrame.new(targetPart.Position)
                 end
                 task.wait(0.05)
+            end
+            -- V3 Floor 2 from Floor 1 also spams jump on arrival for floor-1
+            -- pets so we grab elevated pets on floor 1 (small platforms, podiums,
+            -- pets sitting slightly above ground level).
+            if Config.AutoTPFloor2FromFloor1 and not isSecondFloor then
+                task.spawn(function()
+                    local start = tick()
+                    while (tick() - start) < 5 do
+                        if LocalPlayer:GetAttribute("Stealing") then break end
+                        if hum and hum.Parent then
+                            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                            pcall(function() hum.Jump = true end)
+                        end
+                        task.wait(0.1)
+                    end
+                end)
             end
         end
     end)
@@ -5599,19 +6515,28 @@ function tpToBrainrot()
         end
         local targetPos = targetPart.Position
         local verticalDiff = targetPos.Y - hrp.Position.Y
+        -- Compute an "over" Y that clears anything between us and the target.
+        -- We hop UP to this Y at the target's XZ, then drop down.
+        local overY = math.max(hrp.Position.Y, targetPos.Y) + 20
         if verticalDiff > 2 or targetPos.Y > 25 then
             local plat = Instance.new("Part")
             plat.Name = "XiTempPlatform"
             plat.Size = Vector3.new(6, 1.5, 6)
             plat.Position = Vector3.new(targetPos.X, targetPos.Y - 11, targetPos.Z)
-            plat.Color = Color3.fromRGB(232, 111, 177)
+            plat.Color = Color3.fromRGB(30, 30, 30)
             plat.Material = Enum.Material.Neon
             plat.Anchored = true
             plat.CanCollide = false; pcall(makeOneWay, plat)
             plat.Transparency = 0.3
             plat.Parent = Workspace
             
-            -- Instant teleport instead of lerp
+            -- JUMP-OVER phase: hop up above target first (dodges walls/ceilings).
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.CFrame = CFrame.new(targetPos.X, overY, targetPos.Z)
+            task.wait(0.03)
+            
+            -- Drop onto target (8 studs below target center, onto the platform).
             local targetCF = CFrame.new(targetPos.X, targetPos.Y - 8, targetPos.Z)
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.AssemblyAngularVelocity = Vector3.zero
@@ -5630,7 +6555,13 @@ function tpToBrainrot()
                 plat:Destroy()
             end)
         else
-            -- Instant teleport to brainrot
+            -- JUMP-OVER phase: hop up above target first (dodges walls/ceilings).
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.CFrame = CFrame.new(targetPos.X, overY, targetPos.Z)
+            task.wait(0.03)
+            
+            -- Drop onto brainrot.
             local targetCF = CFrame.new(targetPos)
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.AssemblyAngularVelocity = Vector3.zero
@@ -5665,8 +6596,8 @@ _G.tpToBrainrot = tpToBrainrot
 -- CLICK TO AP
 -- ============================================================
 local ctapHighlight=Instance.new("Highlight",CoreGui)
-ctapHighlight.FillColor=Color3.fromRGB(255,150,200); ctapHighlight.FillTransparency=0.3
-ctapHighlight.OutlineColor=Color3.fromRGB(255,150,200); ctapHighlight.OutlineTransparency=0
+ctapHighlight.FillColor=Color3.fromRGB(80, 80, 80); ctapHighlight.FillTransparency=0.3
+ctapHighlight.OutlineColor=Color3.fromRGB(80, 80, 80); ctapHighlight.OutlineTransparency=0
 ctapHighlight.Adornee=nil; ctapHighlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
 
 local function rayToCubeIntersect(rayOrigin,rayDirection,cubeCenter,cubeSize)
@@ -5766,16 +6697,19 @@ end
 local function clearPlayerESP()
     for uid,entry in pairs(playerBillboards) do if entry.bb then pcall(entry.bb.Destroy,entry.bb) end; playerBillboards[uid]=nil end
 end
-task.spawn(function() while true do task.wait(0.5)
-    if playerESPEnabled then
-        for _,plr in ipairs(Players:GetPlayers()) do if plr~=LocalPlayer then pcall(createOrRefreshPlayerESP,plr) end end
-        for uid,entry in pairs(playerBillboards) do if entry.bb and entry.bb.Parent then
-            pcall(function() local tl=entry.bb:FindFirstChild("ToolLabel"); if tl then local ht=getHeldTool(entry.player); tl.Text=ht or ""
-                if entry.nameLbl then entry.nameLbl.TextColor3=ht and DANGER_TOOLS[ht] and Color3.fromRGB(255,60,60) or Color3.fromRGB(255,255,255) end
-            end end)
-        end end
-    else clearPlayerESP() end
-end end)
+task.spawn(function()
+    task.wait(4)
+    while true do task.wait(0.5)
+        if playerESPEnabled then
+            for _,plr in ipairs(Players:GetPlayers()) do if plr~=LocalPlayer then pcall(createOrRefreshPlayerESP,plr) end end
+            for uid,entry in pairs(playerBillboards) do if entry.bb and entry.bb.Parent then
+                pcall(function() local tl=entry.bb:FindFirstChild("ToolLabel"); if tl then local ht=getHeldTool(entry.player); tl.Text=ht or ""
+                    if entry.nameLbl then entry.nameLbl.TextColor3=ht and DANGER_TOOLS[ht] and Color3.fromRGB(255,60,60) or Color3.fromRGB(255,255,255) end
+                end end)
+            end end
+        else clearPlayerESP() end
+    end
+end)
 
 -- Line To Base ESP (kinqs beam style)
 do
@@ -5885,7 +6819,7 @@ do
     local BEAM_NAME    = "BestPetBeam"
     local ATT0_NAME    = "BestPetBeamAttach_Player"
     local ATT1_NAME    = "BestPetBeamAttach_Target"
-    local BEAM_COLOR   = Color3.fromRGB(255, 45, 190)   -- pink (line to best brainrot)
+    local BEAM_COLOR   = Color3.fromRGB(30, 30, 30)   -- pink (line to best brainrot)
 
     local bestBeam     = nil
     local bestAtt0     = nil
@@ -6080,7 +7014,12 @@ local function refreshBrainrotESP()
     end end
 end
 local function clearBrainrotESP() for _,e in pairs(brainrotBillboards) do if e.bb then e.bb:Destroy() end; if e.highlight then e.highlight:Destroy() end end; brainrotBillboards={} end
-task.spawn(function() while true do task.wait(0.3); if brainrotESPEnabled then pcall(refreshBrainrotESP) end end end)
+task.spawn(function()
+    task.wait(4)
+    while true do task.wait(0.6)
+        if brainrotESPEnabled then pcall(refreshBrainrotESP) end
+    end
+end)
 
 -- Subspace Mine ESP
 local subspaceMineESPEnabled=Config.SubspaceMineESP; local subspaceMineESPData={}
@@ -6101,7 +7040,13 @@ local function refreshSubspaceMineESP()
         data.sel:Destroy(); data.bb:Destroy(); subspaceMineESPData[mineObj]=nil
     end end
 end
-task.spawn(function() while true do if subspaceMineESPEnabled then pcall(refreshSubspaceMineESP) end; task.wait(0.5) end end)
+task.spawn(function()
+    task.wait(4)
+    while true do
+        if subspaceMineESPEnabled then pcall(refreshSubspaceMineESP) end
+        task.wait(1)
+    end
+end)
 
 -- Timer ESP
 local timerESPEnabled=Config.TimerESP
@@ -6126,6 +7071,11 @@ local function refreshTimerESP()
     end
     local plots=Workspace:FindFirstChild("Plots"); if not plots then return end
     for _,plot in ipairs(plots:GetChildren()) do
+        -- Spread the scan across frames: a full plot:GetDescendants() for every
+        -- plot in ONE frame is what stalls the game (13fps spike). Yielding one
+        -- frame per plot turns that single heavy frame into cheap slices.
+        RunService.Heartbeat:Wait()
+        if not timerESPEnabled then return end
         -- The game shows a timer per floor. User wants ONLY the first floor, so
         -- gather this plot's timer billboards and keep just the lowest-Y ones.
         local found = {}
@@ -6158,7 +7108,24 @@ local function refreshTimerESP()
         end
     end
 end
-task.spawn(function() while true do if timerESPEnabled then pcall(refreshTimerESP) else clearTimerESP() end; task.wait(0.5) end end)
+task.spawn(function()
+    task.wait(4)
+    -- When Timer ESP is OFF, clear ONCE then idle -- the old code re-scanned every
+    -- plot's descendants every 0.5s forever even while disabled (a constant FPS
+    -- drain / spike source). Now the full plot-descendant scan only runs while the
+    -- feature is actually on.
+    local _timerCleared = false
+    while true do
+        if timerESPEnabled then
+            _timerCleared = false
+            pcall(refreshTimerESP)
+        elseif not _timerCleared then
+            pcall(clearTimerESP)
+            _timerCleared = true
+        end
+        task.wait(1)
+    end
+end)
 
 -- ============================================================
 -- Base Owner ESP  (red outline + "BASE OWNER" tag on the owner of the
@@ -6242,7 +7209,8 @@ do
         if on then pcall(refresh) else clearAll() end
     end
     _G.clearBaseOwnerESP = clearAll
-    task.spawn(function()
+task.spawn(function()
+        task.wait(4)
         while true do
             task.wait(0.5)
             if enabled then pcall(refresh) end
@@ -6346,10 +7314,13 @@ local function IsCharacterPart(obj)
 end
 
 local function IsOutOfRange(obj)
-	if obj:IsA("BasePart") then
-		local x = obj.Position.X
-		return x < -560 or x > -240
-	end
+	-- DISABLED: this returned true for every part outside a hardcoded X range, and
+	-- those parts were then :Destroy()'d. That deleted game event models like
+	-- Workspace.PhantomSpinWheel (its ".Main" part), so the game's own
+	-- PhantomEventController errored every single frame ("Main is not a valid
+	-- member of Model"). Deleting structural parts to save FPS breaks the game --
+	-- out-of-range parts now fall through to material-flattening instead of deletion.
+	return false
 end
 
 local BASE_NAMES = {
@@ -6525,7 +7496,7 @@ local function setFPSBoostUltra(enabled)
             settings().Physics.AllowSleep = true
             settings().Physics.PhysicsEnvironmentalThrottle = Enum.PhysicsEnvironmentalThrottle or Enum.EnviromentalPhysicsThrottle.Skip
         end)
-        pcall(setfpscap, 0)   -- 0 = unlimited FPS (was 999)
+        pcall(setfpscap, 999)   -- 999 = unlimited FPS (was 999)
 
         OptimizeLightingUltra()
         ApplyTerrainUltra()
@@ -6606,13 +7577,9 @@ local function setFPSBoostUltra(enabled)
             AddUltraConnection(plr.CharacterAdded:Connect(OptimizeCharacterUltra))
         end))
 
-        -- GC Loop
-        AddUltraThread(function()
-            while Config.FPSBoostUltra do
-                task.wait(15)
-                pcall(function() collectgarbage("collect") end)
-            end
-        end)
+        -- GC Loop REMOVED: forced full collectgarbage("collect") every 15s is a
+        -- stop-the-world freeze. Luau's incremental GC handles memory smoothly on
+        -- its own, so we no longer force it.
     else
         -- Clean up all connections and threads
         for _, conn in ipairs(_ultraConnections) do
@@ -7155,11 +8122,28 @@ local function resolvePurchaseRemote()
     return purchaseRemote
 end
 
+-- Throttle each prompt + never stack yielding InvokeServer threads. State lives
+-- in _G (weak-keyed so destroyed prompts GC) instead of do-block locals, because
+-- this scope is already at Luau's 200-local-register limit. The old unthrottled
+-- 150/sec burst just flooded past Roblox's remote rate limit (dropped calls +
+-- kick risk); ~33 landed fires/sec/prompt is faster in practice.
 local function firePurchaseNatural(prompt)
     if not prompt or not prompt.Parent or not prompt.Enabled then return end
+    _G.__abLastFire = _G.__abLastFire or setmetatable({}, {__mode = "k"})
+    _G.__abInFlight = _G.__abInFlight or setmetatable({}, {__mode = "k"})
+    local now = os.clock()
+    local last = _G.__abLastFire[prompt]
+    if last and (now - last) < 0.03 then return end
+    _G.__abLastFire[prompt] = now
+    -- Primary buy: triggers the game's own purchase path (immune to the hashed
+    -- remote breakage). This is what actually completes the purchase.
     pcall(function()
         if fireproximityprompt then fireproximityprompt(prompt) end
     end)
+    -- Secondary (best-effort remote); guarded so a yielding InvokeServer can
+    -- never stack up across frames.
+    if _G.__abInFlight[prompt] then return end
+    _G.__abInFlight[prompt] = true
     task.spawn(function()
         local remote = resolvePurchaseRemote()
         if remote then
@@ -7171,6 +8155,7 @@ local function firePurchaseNatural(prompt)
                 end
             end)
         end
+        _G.__abInFlight[prompt] = nil
     end)
 end
 
@@ -7209,8 +8194,13 @@ local function stopCarpetLock()
     if carpetLockConn then carpetLockConn:Disconnect(); carpetLockConn = nil end
 end
 
-local HOVER_HEIGHT = 5
-local BUY_INTERVAL = 0.08
+local HOVER_HEIGHT = 3
+-- BUY_INTERVAL: how often the purchase loop fires. Was 0.08s (~12/sec). At 0.02s
+-- we get ~50 attempts/sec, and with a 3-fire burst per tick that's ~150/sec —
+-- well under Roblox's ~200/sec remote rate limit but well above other players'
+-- default click cadence.
+local BUY_INTERVAL = 0.02
+local BUY_BURST = 3
 local DETECT_RADIUS = 17
 local lockedTarget = nil
 local lockedPart = nil
@@ -7228,15 +8218,20 @@ local bodyPos = nil
 local function ensureBodyPos(hrp)
     if bodyPos and bodyPos.Parent == hrp then
         local speed = math.clamp(Config.AutoGrabSpeed or 17, 5, 100)
-        bodyPos.P = speed * 1000
+        -- P was speed*1000 (17000 default). At speed*8000 (~136000) the
+        -- character snaps to the hover point in ~1 frame instead of drifting
+        -- toward it over several. D bumped to 2000 for critical damping so it
+        -- doesn't overshoot and wobble.
+        bodyPos.P = speed * 8000
+        bodyPos.D = 2000
         return bodyPos
     end
     if bodyPos then bodyPos:Destroy() end
     local speed = math.clamp(Config.AutoGrabSpeed or 17, 5, 100)
     local bp = Instance.new("BodyPosition", hrp)
     bp.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-    bp.P = speed * 1000
-    bp.D = 1000
+    bp.P = speed * 8000
+    bp.D = 2000
     bp.Position = hrp.Position
     bodyPos = bp
     return bp
@@ -7263,16 +8258,36 @@ task.spawn(function()
     while true do
         task.wait(BUY_INTERVAL)
         if not autoBuyActive then continue end
-        if not partAlive() then continue end
-        if promptAlive() then
+        -- Primary: keep firing the locked prompt (throttled internally to ~33/sec,
+        -- so it lands a call in every server frame without flooding).
+        if partAlive() and promptAlive() then
             firePurchaseNatural(lockedTarget.prompt)
+        end
+        -- Also fire EVERY other purchasable prompt in range, so multiple conveyor
+        -- items get bought per second instead of only the single nearest one.
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local radius = (Config.AutoBuyRange or DETECT_RADIUS) + 8
+            local hp = hrp.Position
+            local lockedPrompt = lockedTarget and lockedTarget.prompt
+            for _, entry in ipairs(SharedState.ConveyorAnimals) do
+                local pr = entry.prompt
+                if pr and pr ~= lockedPrompt and pr.Parent and pr.Enabled
+                    and entry.part and entry.part.Parent
+                    and (hp - entry.part.Position).Magnitude <= radius then
+                    firePurchaseNatural(pr)
+                end
+            end
         end
     end
 end)
 
 task.spawn(function()
     while true do
-        task.wait(0.25)
+        -- Was 0.25s -- at 0.075s we detect new conveyor items about 3.3x
+        -- faster, closing the gap between spawn and first purchase attempt.
+        task.wait(0.075)
         if not autoBuyActive then
             lockedTarget = nil
             lockedPart = nil
@@ -7312,6 +8327,15 @@ task.spawn(function()
             lockedModel = best.model or best.part.Parent
             ShowNotification("AUTO BUY", "Locked: " .. best.name)
             startCarpetLock()
+            -- Immediate burst fire: don't wait ~BUY_INTERVAL for the purchase
+            -- loop to tick. Every ms matters when other clients are racing
+            -- for the same item.
+            task.spawn(function()
+                for _ = 1, BUY_BURST do
+                    if not (best.prompt and best.prompt.Parent and best.prompt.Enabled) then break end
+                    firePurchaseNatural(best.prompt)
+                end
+            end)
         end
     end
 end)
@@ -7375,15 +8399,15 @@ local function buildRemoteSell()
         local Shared=ReplicatedStorage:WaitForChild("Shared",10); local Utils=ReplicatedStorage:WaitForChild("Utils",10)
         if Pkgs then Synchronizer_rs=require(Pkgs:WaitForChild("Synchronizer")) end
         if Datas then AnimalsData_rs=require(Datas:WaitForChild("Animals")) end
-        if Shared then AnimalsShared_rs=require(Shared:WaitForChild("Animals")) end
+        if Shared then AnimalsShared_rs=_G._xenAnimShim end
         if Utils then NumberUtils_rs=require(Utils:WaitForChild("NumberUtils")) end
     end)
 
     local function findMyPlotRS()
         local plots=Workspace:FindFirstChild("Plots"); if not plots then return nil end
         for _,plot in ipairs(plots:GetChildren()) do
-            if Synchronizer_rs then local ok,ch=pcall(function() return Synchronizer_rs:Get(plot.Name) end)
-                if ok and ch then local owner=ch:Get("Owner")
+            if Synchronizer_rs then local ok,ch=pcall(function() return _G.XenSyncGet(plot.Name) end)
+                if ok and ch then local owner=_G.sProp(ch, "Owner")
                     if (typeof(owner)=="Instance" and owner==player) or (typeof(owner)=="table" and owner.UserId==player.UserId) then return plot end
                 end
             end
@@ -7461,9 +8485,9 @@ local function buildRemoteSell()
                             local name = "Slot " .. podiumNum
                             if Synchronizer_rs and AnimalsData_rs then
                                 pcall(function()
-                                    local ch = Synchronizer_rs:Get(plot.Name)
+                                    local ch = _G.XenSyncGet(plot.Name)
                                     if ch then
-                                        local al = ch:Get("AnimalList")
+                                        local al = _G.sProp(ch, "AnimalList")
                                         if al then
                                             local entry = al[podiumNum] or al[tostring(podiumNum)]
                                             if type(entry) == "table" and entry.Index then
@@ -7741,7 +8765,7 @@ end
 corner = function(o,r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r); c.Parent=o; return c end
 stroke = function(o,col,th,tr) local s=Instance.new("UIStroke"); s.Color=col or Theme.Stroke; s.Thickness=th or 1; s.Transparency=tr or 0; s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; s.Parent=o; return s end
 tw = function(o,p,t) TweenService:Create(o,TweenInfo.new(t or 0.14,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),p):Play() end
-addOutline = function(f) local o=Instance.new("UIStroke"); o.Color=Theme.AccentLight; o.Thickness=1.25; o.Transparency=0.08; o.ApplyStrokeMode=Enum.ApplyStrokeMode.Border; o.Parent=f; return o end
+addOutline = function(f) end
 function clearBody(body) for _,c in ipairs(body:GetChildren()) do if not c:IsA("UIListLayout") and not c:IsA("UIPadding") then c:Destroy() end end end
 
 function openAnim(f) if not f then return end; local us=f:FindFirstChild("SXEScale") or Instance.new("UIScale"); us.Name="SXEScale"; us.Parent=f
@@ -7800,10 +8824,9 @@ end
 
 function makeHeader(f,t,isMain) local h=Instance.new("Frame"); h.Size=UDim2.new(1,0,0,42); h.BackgroundTransparency=1; h.Parent=f
     local parts={}; for s in string.gmatch(t,"([^\n]+)") do table.insert(parts,s) end
-    if isMain then local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,-50,0,24); l.Position=UDim2.new(0,13,0,8); l.BackgroundTransparency=1; l.Text=parts[1] or "SXE HUB PRIVAT"; l.TextColor3=Theme.Text; l.Font=Enum.Font.GothamBlack; l.TextSize=16; l.TextXAlignment=Enum.TextXAlignment.Left; l.Parent=h
-    else local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,-58,0,16); l.Position=UDim2.new(0,12,0,7); l.BackgroundTransparency=1; l.Text=parts[1] or "SXE HUB PRIVAT"; l.TextColor3=Theme.Text; l.Font=Enum.Font.GothamBlack; l.TextSize=12; l.TextXAlignment=Enum.TextXAlignment.Center; l.Parent=h
-        local s=Instance.new("TextLabel"); s.Size=UDim2.new(1,-58,0,13); s.Position=UDim2.new(0,12,0,21); s.BackgroundTransparency=1; s.Text=parts[2] or ""; s.TextColor3=Theme.Dim; s.Font=Enum.Font.GothamMedium; s.TextSize=10; s.TextXAlignment=Enum.TextXAlignment.Center; s.Parent=h end
-    local d=Instance.new("Frame"); d.Size=UDim2.new(1,-24,0,1); d.Position=UDim2.new(0,12,0,40); d.BackgroundColor3=Theme.AccentLight; d.BackgroundTransparency=isMain and 0.25 or 0.04; d.BorderSizePixel=0; d.Parent=f
+    if isMain then local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,-50,0,24); l.Position=UDim2.new(0,13,0,8); l.BackgroundTransparency=1; l.Text=parts[2] or parts[1] or ""; l.TextColor3=Theme.Text; l.Font=Enum.Font.GothamBlack; l.TextSize=16; l.TextXAlignment=Enum.TextXAlignment.Left; l.Parent=h
+    else local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,-58,0,16); l.Position=UDim2.new(0,12,0,7); l.BackgroundTransparency=1; l.Text=parts[2] or parts[1] or ""; l.TextColor3=Theme.Text; l.Font=Enum.Font.GothamBlack; l.TextSize=12; l.TextXAlignment=Enum.TextXAlignment.Center; l.Parent=h
+        local s=Instance.new("TextLabel"); s.Size=UDim2.new(1,-58,0,13); s.Position=UDim2.new(0,12,0,21); s.BackgroundTransparency=1; s.Text=parts[3] or ""; s.TextColor3=Theme.Dim; s.Font=Enum.Font.GothamMedium; s.TextSize=10; s.TextXAlignment=Enum.TextXAlignment.Center; s.Parent=h end
     makeDraggable(f,h,t); return h end
 
 function makeMainPanel(t,size,pos) local f=Instance.new("Frame"); f.Size=size; f.Position=pos; f.BackgroundColor3=Theme.MainBackground; f.BackgroundTransparency=0.06; f.BorderSizePixel=0; f.ClipsDescendants=true; f.Parent=gui; corner(f,12); addOutline(f); makeHeader(f,t,true)
@@ -8012,7 +9035,7 @@ function makeKeybindRow(parent,nameText)
 end
 
 -- CREATE PANELS
-main,mainBody=makeMainPanel("SXE HUB PRIVAT",UDim2.new(0,375,0,480),UDim2.new(0.5,-187,0.5,-255))
+main,mainBody=makeMainPanel("",UDim2.new(0,375,0,480),UDim2.new(0.5,-187,0.5,-255))
 if Config.AutoCloseOnExec then main.Visible = false end
 panels["Invisible Steal Panel"],panels["InvisStealBody"]=makeQuickPanel("SXE HUB PRIVAT\nInvisible Steal",UDim2.new(0,230,0,375),UDim2.new(0,80,0.5,-220))
 panels["InvisStealBody"].ScrollBarThickness = 0
@@ -8079,6 +9102,16 @@ function rebuildActions()
             end)
         end
     end) end
+    if actionConfig["JP"] then makeQuickButton(panels["ActionsBody"],"JP",function()
+        if PrivateServerCode and PrivateServerCode ~= "" then
+            pcall(function() TeleportService:TeleportToPrivateServer(game.PlaceId, PrivateServerCode, {LocalPlayer}) end)
+            task.delay(0.3, function()
+                pcall(function() game:GetService("ExperienceService"):LaunchExperience({placeId=game.PlaceId,linkCode=PrivateServerCode}) end)
+            end)
+        else
+            ShowNotification("JOIN PS","No private server code set!")
+        end
+    end) end
     if actionConfig["Reset (X)"] then makeQuickButton(panels["ActionsBody"],"Reset (X)",function() executeReset() end,Theme.SoftAccentHover) end
     if actionConfig["Anti Ragdoll"] then makeSyncStateRow(panels["ActionsBody"],"Anti Ragdoll:","Anti Ragdoll",function(on) if on then startAntiRagdoll() else stopAntiRagdoll() end end) end
     if actionConfig["Infinite Jump"] then makeSyncStateRow(panels["ActionsBody"],"Infinite Jump:","Infinite Jump",function(on) setInfiniteJump(on) end) end
@@ -8109,7 +9142,7 @@ function rebuildTpSpeedSettings()
     makeMainSliderWithInput(tpSpeedSettingsBody, "Fly TP Speed", 50, 300, Config.TpSettings.FlyTPSpeed or 160, function(v) Config.TpSettings.FlyTPSpeed=v; saveConfig() end)
     makeMainSliderWithInput(tpSpeedSettingsBody, "100 Studs Base Speed", 20, 250, Config.TpSettings.FlyTPCloseSpeed or 75, function(v) Config.TpSettings.FlyTPCloseSpeed=v; saveConfig() end)
     makeMainSliderWithInput(tpSpeedSettingsBody, "Grabble TP Speed", 50, 600, Config.TpSettings.GrabbleTPSpeed or 230, function(v) Config.TpSettings.GrabbleTPSpeed=v; saveConfig(); if _G.SXESetCarpetSpeed then pcall(_G.SXESetCarpetSpeed, v) end end)
-    makeMainSliderWithInput(tpSpeedSettingsBody, "Walk To Brainrot Speed", 50, 300, Config.TpSettings.WalkTPSpeed or 190, function(v) Config.TpSettings.WalkTPSpeed=v; saveConfig() end)
+    makeMainSliderWithInput(tpSpeedSettingsBody, "Walk To Brainrot Speed", 50, 1000, Config.TpSettings.WalkTPSpeed or 190, function(v) Config.TpSettings.WalkTPSpeed=v; saveConfig() end)
     makeMainSliderWithInput(tpSpeedSettingsBody, "Clone Delay", 0.05, 2.0, Config.TpSettings.CloneDelayVal or 0.1, function(v) Config.TpSettings.CloneDelayVal=v; saveConfig() end, "s")
     makeQuickButton(tpSpeedSettingsBody, "Close", function() closeAnim(tpSpeedSettingsPanel) end, Theme.SoftAccentHover)
 end
@@ -8131,7 +9164,7 @@ do
     -- WALKSPEED CONTROL (CFrame Bypass, min 15 max 29)
     regToggle("WalkSpeed", Config.WalkSpeedEnabled)
     makeSyncStateRow(panels["InvisStealBody"],"WalkSpeed:","WalkSpeed",function(on) setWalkSpeedEnabled(on) end)
-    makeMainSliderWithInput(panels["InvisStealBody"], "Walk Speed", 15, 29, Config.WalkSpeedValue or 16, function(v)
+    makeMainSliderWithInput(panels["InvisStealBody"], "Walk Speed", 15, 50, Config.WalkSpeedValue or 16, function(v)
         local clamped = setWalkSpeedValue(v)
     end)
     if Config.WalkSpeedEnabled then
@@ -8224,9 +9257,9 @@ function spamBaseOwner()
     local targetPlayer = nil
     local ok, Synchronizer = pcall(require, ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Synchronizer"))
     if ok and Synchronizer then
-        local ch = Synchronizer:Get(nearestPlot.Name)
+        local ch = _G.SXE_GetPlotChannel(nearestPlot.Name)
         if ch then
-            local owner = ch:Get("Owner")
+            local owner = _G.sProp(ch, "Owner")
             if owner then
                 if (typeof(owner) == "Instance") and owner:IsA("Player") then
                     targetPlayer = owner
@@ -8291,7 +9324,7 @@ makeSyncStateRow(panels["StealBody"],"Auto Steal:","Auto Steal",function(on)
     -- SXE Clone-TP engine owns the auto-steal loop unconditionally.
     if _G.SXEAutoSteal then pcall(_G.SXEAutoSteal, on) end
 end)
-makeSyncStateRow(panels["StealBody"],"Steal Highest:","Steal Highest",function(on) if on then setStealMode("Highest") end end)
+
 makeSyncStateRow(panels["StealBody"],"Steal Priority:","Steal Priority",function(on) if on then setStealMode("Priority") end end)
 makeSyncStateRow(panels["StealBody"],"Steal Nearest:","Steal Nearest",function(on) if on then setStealMode("Nearest") end end)
 makeSyncStateRow(panels["StealBody"],"Auto Buy:","Auto Buy",function(on)
@@ -8529,15 +9562,16 @@ LazyInit("Admin Panel UI", function() -- ADMIN PANEL UI SCOPE
             row.BackgroundColor3 = isAlt and Theme.Row or Theme.Panel
         end)
 
-        local avatarH=Instance.new("Frame"); avatarH.BackgroundColor3=Theme.InputBg; avatarH.BorderSizePixel=0; avatarH.Size=UDim2.fromOffset(34,34); avatarH.Position=UDim2.fromOffset(8,10); avatarH.Parent=row; corner(avatarH,8)
-        local avatar=Instance.new("ImageLabel"); avatar.BackgroundTransparency=1; avatar.Size=UDim2.fromScale(1,1); avatar.ZIndex=10; avatar.Parent=avatarH; corner(avatar,8)
-        task.spawn(function() local ok,img=pcall(function() return Players:GetUserThumbnailAsync(plr.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size48x48) end); if ok then avatar.Image=img end end)
-        local headshotStroke=Instance.new("UIStroke",avatarH); headshotStroke.Color=Theme.Accent; headshotStroke.Thickness=2; headshotStroke.Transparency=0.3
-
         local txtW=-(actW+60)
-        local nameLabel=Instance.new("TextLabel"); nameLabel.Size=UDim2.new(1,txtW,0,20); nameLabel.Position=UDim2.fromOffset(50,6); nameLabel.BackgroundTransparency=1; nameLabel.Text=plr.DisplayName; nameLabel.Font=Enum.Font.GothamBold; nameLabel.TextSize=14; nameLabel.TextColor3=Theme.Text; nameLabel.TextXAlignment=Enum.TextXAlignment.Left; nameLabel.ZIndex=10; nameLabel.Parent=row
-        local userL=Instance.new("TextLabel"); userL.BackgroundTransparency=1; userL.Position=UDim2.fromOffset(50,23); userL.Size=UDim2.new(1,txtW,0,16); userL.TextXAlignment=Enum.TextXAlignment.Left; userL.Text="@"..plr.Name; userL.Font=Enum.Font.GothamMedium; userL.TextSize=10; userL.TextColor3=Theme.Dim; userL.ZIndex=10; userL.Parent=row
-        local statusL=Instance.new("TextLabel"); statusL.BackgroundTransparency=1; statusL.Position=UDim2.fromOffset(50,37); statusL.Size=UDim2.new(1,txtW,0,14); statusL.TextXAlignment=Enum.TextXAlignment.Left; statusL.Text=""; statusL.Font=Enum.Font.GothamBold; statusL.TextSize=11; statusL.TextColor3=Theme.AccentLight; statusL.ZIndex=10; statusL.Parent=row
+        local nameLabel=Instance.new("TextLabel"); nameLabel.Size=UDim2.new(1,txtW,0,20); nameLabel.Position=UDim2.fromOffset(8,6); nameLabel.BackgroundTransparency=1; nameLabel.RichText=true; nameLabel.Text=plr.DisplayName; nameLabel.Font=Enum.Font.GothamBold; nameLabel.TextSize=14; nameLabel.TextColor3=Theme.Text; nameLabel.TextXAlignment=Enum.TextXAlignment.Left; nameLabel.ZIndex=10; nameLabel.Parent=row
+        -- FMLY tags: red [BAD BOY] for bad boys, green [PROTECTED] for good boys.
+        if _G.SXEIsBadBoy and _G.SXEIsBadBoy(plr) then
+            nameLabel.Text = plr.DisplayName .. '  <font color="#ff5555">[BAD BOY]</font>'
+        elseif _G.SXEIsGoodBoy and _G.SXEIsGoodBoy(plr) then
+            nameLabel.Text = plr.DisplayName .. '  <font color="#5aff8c">[PROTECTED]</font>'
+        end
+        local userL=Instance.new("TextLabel"); userL.BackgroundTransparency=1; userL.Position=UDim2.fromOffset(8,23); userL.Size=UDim2.new(1,txtW,0,16); userL.TextXAlignment=Enum.TextXAlignment.Left; userL.Text="@"..plr.Name; userL.Font=Enum.Font.GothamMedium; userL.TextSize=10; userL.TextColor3=Theme.Dim; userL.ZIndex=10; userL.Parent=row
+        local statusL=Instance.new("TextLabel"); statusL.BackgroundTransparency=1; statusL.Position=UDim2.fromOffset(8,37); statusL.Size=UDim2.new(1,txtW,0,14); statusL.TextXAlignment=Enum.TextXAlignment.Left; statusL.Text=""; statusL.Font=Enum.Font.GothamBold; statusL.TextSize=11; statusL.TextColor3=Theme.AccentLight; statusL.ZIndex=10; statusL.Parent=row
         stealLabels[plr.UserId]=statusL
 
         local actions=Instance.new("Frame"); actions.BackgroundTransparency=1; actions.AnchorPoint=Vector2.new(1,0.5); actions.Position=UDim2.new(1,-8,0.5,0); actions.Size=UDim2.fromOffset(actW+10,38); actions.ZIndex=12; actions.Parent=row
@@ -8578,7 +9612,6 @@ LazyInit("Admin Panel UI", function() -- ADMIN PANEL UI SCOPE
                 blacklistBtn.TextColor3 = Color3.new(1, 1, 1)
                 
                 row.BackgroundTransparency = 0.85
-                avatar.ImageTransparency = 0.75
                 nameLabel.TextTransparency = 0.6
                 userL.TextTransparency = 0.6
                 statusL.TextTransparency = 0.6
@@ -8594,7 +9627,6 @@ LazyInit("Admin Panel UI", function() -- ADMIN PANEL UI SCOPE
                 blacklistBtn.TextColor3 = Color3.fromRGB(255, 60, 60)
                 
                 row.BackgroundTransparency = 0.40
-                avatar.ImageTransparency = 0
                 nameLabel.TextTransparency = 0
                 userL.TextTransparency = 0
                 statusL.TextTransparency = 0
@@ -8740,7 +9772,6 @@ local function getAllAnimalNames()
     end)
     return _allAnimalNames
 end
-task.spawn(getAllAnimalNames)
 
 -- Drag state for priority reorder
 local _priDragState = {active = false, fromIndex = nil, ghostFrame = nil, overlay = nil}
@@ -8921,29 +9952,16 @@ function loadTab(tabName)
             end
             saveConfig()
         end)
-        makeMainToggle(mainBody,"Auto TP Highest Gen",Config.AutoTPHighestGen,function(on)
-            Config.AutoTPHighestGen=on
-            if on then
-                if BoundToggles["Auto TP Priority Mode"] then BoundToggles["Auto TP Priority Mode"](false, false) end
-                if BoundToggles["Auto TP Highest Value"] then BoundToggles["Auto TP Highest Value"](false, false) end
-                Config.AutoTPPriority = false
-                Config.AutoTPHighestValue = false
-            end
+
+        makeMainToggle(mainBody,"V3: Floor 2 from Floor 1",Config.AutoTPFloor2FromFloor1,function(on)
+            Config.AutoTPFloor2FromFloor1 = on
             saveConfig()
+            ShowNotification("V3 F2 FROM F1", on and "ENABLED" or "DISABLED")
         end)
-        makeMainToggle(mainBody,"Auto TP Highest Value",Config.AutoTPHighestValue,function(on)
-            Config.AutoTPHighestValue=on
-            if on then
-                if BoundToggles["Auto TP Priority Mode"] then BoundToggles["Auto TP Priority Mode"](false, false) end
-                if BoundToggles["Auto TP Highest Gen"] then BoundToggles["Auto TP Highest Gen"](false, false) end
-                Config.AutoTPPriority = false
-                Config.AutoTPHighestGen = false
-            end
-            saveConfig()
-        end)
+
         makeMainToggle(mainBody,"TP on Load",Config.TpSettings.TpOnLoad,function(on) Config.TpSettings.TpOnLoad=on; saveConfig() end)
         -- TP Tool selection (radio button style)
-        local toolOptions={"Flying Carpet","Cupid's Wings","Santa's Sleigh","Witch's Broom","Waverider"}
+        local toolOptions={"Flying Carpet","Cupid's Wings","Witch's Broom","Waverider","Santa's Sleigh"}
         local toolToggles={}
         for _,tn in ipairs(toolOptions) do
             toolToggles[tn]=makeMainToggle(mainBody,tn,Config.TpSettings.Tool==tn,function(on)
@@ -8954,14 +9972,6 @@ function loadTab(tabName)
             end)
         end
         -- TP Version
-        makeMainToggle(mainBody,"Fly TP",Config.TpSettings.FlyTP,function(on)
-            Config.TpSettings.FlyTP=on
-            if on then
-                Config.TpSettings.GrabbleTP = false
-                if BoundToggles["Grabble TP"] then BoundToggles["Grabble TP"](false, false) end
-            end
-            saveConfig()
-        end)
         makeMainToggle(mainBody,"Grabble TP",Config.TpSettings.GrabbleTP,function(on)
             Config.TpSettings.GrabbleTP=on
             if on then
@@ -8973,6 +9983,17 @@ function loadTab(tabName)
             if _G.SXEAutoSteal then
                 pcall(_G.SXEAutoSteal, on and (Config.AutoStealEnabled or false))
             end
+        end)
+        makeMainToggle(mainBody,"Fly TP",Config.TpSettings.FlyTP,function(on)
+            Config.TpSettings.FlyTP=on
+            -- Fly TP and Grabble TP are mutually exclusive — Fly TP flies over
+            -- obstacles via velocity + raycasts, Grabble TP clones through walls.
+            if on then
+                Config.TpSettings.GrabbleTP = false
+                if BoundToggles["Grabble TP"] then BoundToggles["Grabble TP"](false, false) end
+            end
+            saveConfig()
+            ShowNotification("FLY TP", on and "ENABLED" or "DISABLED")
         end)
         makeMainToggle(mainBody,"Carpet to Brainrot",Config.TpSettings.BrainrotCarpet,function(on) Config.TpSettings.BrainrotCarpet=on; saveConfig() end)
 
@@ -8989,12 +10010,6 @@ function loadTab(tabName)
 
         makeMainToggle(mainBody,"Player ESP",playerESPEnabled,function(on) playerESPEnabled=on; Config.PlayerESP=on; saveConfig(); if on then task.spawn(function() for _,pl in ipairs(Players:GetPlayers()) do if pl~=LocalPlayer then pcall(createOrRefreshPlayerESP,pl) end end end) else clearPlayerESP() end end)
         makeMainToggle(mainBody,"Brainrot ESP",brainrotESPEnabled,function(on) brainrotESPEnabled=on; Config.BrainrotESP=on; saveConfig(); if on then task.spawn(function() pcall(refreshBrainrotESP) end) else clearBrainrotESP() end end)
-        makeSyncMainToggle(mainBody,"Timer ESP","Timer ESP",function(on)
-            timerESPEnabled=on
-            Config.TimerESP=on
-            saveConfig()
-            if on then task.spawn(function() pcall(refreshTimerESP) end) else clearTimerESP() end
-        end)
         makeMainToggle(mainBody,"Subspace Mine ESP",subspaceMineESPEnabled,function(on) subspaceMineESPEnabled=on; Config.SubspaceMineESP=on; saveConfig() end)
         makeMainToggle(mainBody,"Base Owner ESP",Config.BaseOwnerESP,function(on) if _G.setBaseOwnerESP then _G.setBaseOwnerESP(on) end end)
         makeMainToggle(mainBody,"Line To Base",Config.LineToBase,function(on)
@@ -9002,21 +10017,15 @@ function loadTab(tabName)
             if on then if _G.createPlotBeam then pcall(_G.createPlotBeam) end
             else if _G.resetPlotBeam then pcall(_G.resetPlotBeam) end end
         end)
-        makeMainToggle(mainBody,"Line To Best Brainrot",Config.LineToBrainrot or false,function(on)
-            Config.LineToBrainrot=on; saveConfig()
-            if on then -- beam auto-creates via heartbeat
-            else if _G.resetBrainrotBeam then pcall(_G.resetBrainrotBeam) end end
-        end)
 
     elseif tabName=="UI" then
-        for _,name in ipairs({"Invisible Steal Panel","Admin Command Panel","Command Cooldowns","Actions","Steal Panel","Steal Target"}) do
+        for _,name in ipairs({"Invisible Steal Panel","Admin Command Panel","Steal Panel","Steal Target"}) do
             makeMainToggle(mainBody,name,panels[name].Visible,function(on)
                 Config.Visibilities[name]=on
                 saveConfig()
                 if on then openAnim(panels[name]) else closeAnim(panels[name]) end
             end)
         end
-        makeMainToggle(mainBody,"Remote Sell Panel",Config.RemoteSellEnabled,function(on) if _G.toggleRemoteSell then _G.toggleRemoteSell(on) end end)
         makeMainToggle(mainBody,"Clear Error Popups",Config.CleanErrorGUIs,function(on) Config.CleanErrorGUIs=on; saveConfig() end)
         makeMainToggle(mainBody,"Auto Close Main UI on Execute",Config.AutoCloseOnExec,function(on) Config.AutoCloseOnExec=on; saveConfig() end)
         makeMainToggle(mainBody,"Admin Panel UI",Config.AdminPanelUI ~= nil and Config.AdminPanelUI or true,function(on)
@@ -9102,9 +10111,6 @@ function loadTab(tabName)
             bottomBar.Position=UDim2.new(0.5,-287,1,-125); Config.positions={}; saveConfig()
         end)
         local lockBtn; lockBtn=makeMainButton(mainBody,UI.Locked and "Locked" or "Unlocked",function() UI.Locked=not UI.Locked; Config.locked=UI.Locked; saveConfig(); lockBtn.Text=UI.Locked and "Locked" or "Unlocked" end,Theme.SoftButton)
-        
-        makeMainToggle(mainBody,"Priority Sound Alert",Config.PrioritySoundAlert,function(on) Config.PrioritySoundAlert=on; saveConfig() end)
-        makeMainTextBox(mainBody,"Custom Sound ID",Config.PrioritySoundID or "e.g. 123456789","e.g. 123456789",function(v) Config.PrioritySoundID=v; saveConfig() end)
 
     elseif tabName=="Misc" then
         -- NO Unwalk, NO Steal Speed, NO FPS Boost (moved to Performance)
@@ -9425,8 +10431,8 @@ function loadTab(tabName)
         makePriorityAddRow(); makePriorityRestoreRow(); for i=1,#priorityList do makePriorityRow(i) end
 
     elseif tabName=="Performance" then
-        makeSyncMainToggle(mainBody,"FPS Boost (normal)","FPS Boost (normal)",function(on) setFPSBoost(on) end)
-        makeSyncMainToggle(mainBody,"FPS Boost Ultra","FPSBoostUltra",function(on) setFPSBoostUltra(on) end)
+        makeSyncMainToggle(mainBody,"FPS Boost (normal)","FPS Boost (normal)",function(on) if setFPSBoost then setFPSBoost(on) end end)
+        makeSyncMainToggle(mainBody,"FPS Boost Ultra","FPS Boost Ultra",function(on) if setFPSBoostUltra then setFPSBoostUltra(on) end end)
         makeSyncMainToggle(mainBody,"Xray","XRay",function(on) setXRay(on) end)
         makeQuickSlider(mainBody,"FOV",50,120,Config.FOV or 70,function(v) Config.FOV=v; saveConfig(); pcall(function() Workspace.CurrentCamera.FieldOfView=v end) end)
     end
@@ -9443,27 +10449,7 @@ end
 for tabName,btn in pairs(tabButtons) do btn.MouseButton1Click:Connect(function() loadTab(tabName) end) end
 
 -- BOTTOM BAR
-bottomBar=Instance.new("Frame"); bottomBar.Size=UDim2.new(0,575,0,50); bottomBar.Position=UDim2.new(0.5,-287,1,-125); bottomBar.BackgroundColor3=Theme.Background; bottomBar.BackgroundTransparency=0.02; bottomBar.BorderSizePixel=0; bottomBar.Parent=gui; corner(bottomBar,12); addOutline(bottomBar)
-local iw=Instance.new("Frame"); iw.Size=UDim2.new(0,34,0,34); iw.Position=UDim2.new(0,12,0.5,-17); iw.BackgroundColor3=Theme.SoftAccent; iw.BorderSizePixel=0; iw.Parent=bottomBar; corner(iw,8)
-local ic=Instance.new("ImageLabel"); ic.Size=UDim2.new(1,0,1,0); ic.BackgroundTransparency=1; ic.ScaleType=Enum.ScaleType.Fit; ic.Parent=iw; corner(ic,8)
 
-_G.updateLogoImage = function(isDark)
-    if isDark then
-        ic.Image = "rbxthumb://type=Asset&id=98944824494349&w=150&h=150"
-    else
-        ic.Image = "rbxthumb://type=Asset&id=110857950376835&w=150&h=150"
-    end
-    ic.ImageColor3 = Color3.fromRGB(255, 255, 255)
-    iw.BackgroundColor3 = Theme.SoftAccent
-end
-_G.updateLogoImage(Config and Config.DarkMode or false)
-local lg=Instance.new("TextLabel"); lg.Size=UDim2.new(0,150,0,26); lg.Position=UDim2.new(0,54,0,5); lg.BackgroundTransparency=1; lg.Text="SXE HUB PRIVAT"; lg.TextColor3=Theme.AccentLight; lg.Font=Enum.Font.GothamBlack; lg.TextSize=19; lg.TextXAlignment=Enum.TextXAlignment.Left; lg.Parent=bottomBar
-local dd=Instance.new("TextLabel"); dd.Size=UDim2.new(0,20,0,26); dd.Position=UDim2.new(0,210,0,5); dd.BackgroundTransparency=1; dd.Text="|"; dd.TextColor3=Theme.AccentLight; dd.Font=Enum.Font.GothamBlack; dd.TextSize=18; dd.Parent=bottomBar
-local dc=Instance.new("TextLabel"); dc.Size=UDim2.new(0,210,0,26); dc.Position=UDim2.new(0,230,0,5); dc.BackgroundTransparency=1; dc.Text="discord.gg/sxehub"; dc.TextColor3=Theme.AccentLight; dc.Font=Enum.Font.GothamBold; dc.TextSize=16; dc.TextXAlignment=Enum.TextXAlignment.Left; dc.Parent=bottomBar
-local sb=Instance.new("TextLabel"); sb.Size=UDim2.new(0,290,0,14); sb.Position=UDim2.new(0,55,0,30); sb.BackgroundTransparency=1; sb.Text="By:@SE67 and @SXLVATORE"; sb.TextColor3=Theme.Dim; sb.Font=Enum.Font.GothamSemibold; sb.TextSize=8; sb.TextXAlignment=Enum.TextXAlignment.Left; sb.Parent=bottomBar
-local rightDiv=Instance.new("Frame"); rightDiv.Size=UDim2.new(0,1,0,36); rightDiv.Position=UDim2.new(1,-138,0.5,-18); rightDiv.BackgroundColor3=Theme.Accent; rightDiv.BackgroundTransparency=0.35; rightDiv.BorderSizePixel=0; rightDiv.Parent=bottomBar
-fpsText=Instance.new("TextLabel"); fpsText.Size=UDim2.new(0,126,1,0); fpsText.Position=UDim2.new(1,-128,0,0); fpsText.BackgroundTransparency=1; fpsText.Text="FPS: --\nPING: --ms"; fpsText.TextColor3=Theme.Green; fpsText.Font=Enum.Font.GothamBold; fpsText.TextSize=10; fpsText.TextXAlignment=Enum.TextXAlignment.Left; fpsText.Parent=bottomBar
-if _G.addLazyUI then _G.addLazyUI(bottomBar, true) end
 
 task.defer(function()
     loadTab("Auto TP")
@@ -9473,7 +10459,7 @@ end)
 -- FPS/PING COUNTER
 local frames,lastT=0,tick()
 _G.currentFPS = 60
-RunService.RenderStepped:Connect(function() frames=frames+1; local now=tick(); if now-lastT>=1 then local fps=frames; _G.currentFPS=fps; frames=0; lastT=now; local ping=0; pcall(function() ping=math.floor(LocalPlayer:GetNetworkPing() * 1000) end); fpsText.Text="FPS: "..fps.."\nPING: "..ping.."ms" end end)
+RunService.RenderStepped:Connect(function() frames=frames+1; local now=tick(); if now-lastT>=1 then local fps=frames; _G.currentFPS=fps; frames=0; lastT=now; local ping=0; pcall(function() ping=math.floor(LocalPlayer:GetNetworkPing() * 1000) end); if fpsText and fpsText.Parent then pcall(function() fpsText.Text="FPS: "..fps.."\nPING: "..ping.."ms" end) end end end)
 
 -- INPUT HANDLER (NO Steal Speed, NO Unwalk keybinds)
 UIS.InputBegan:Connect(function(input,gp) if gp then return end; if input.UserInputType~=Enum.UserInputType.Keyboard then return end
@@ -9500,7 +10486,15 @@ UIS.InputBegan:Connect(function(input,gp) if gp then return end; if input.UserIn
         ["Ragdoll Self"]=function() pcall(runAdminCommand,player,"ragdoll") end,
         ["Invisible Steal"]=function() if _G.toggleInvisibleSteal then pcall(_G.toggleInvisibleSteal) end end,
         ["Rejoin Job ID"]=function() pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player) end) end,
-        ["Manual TP"]=function() task.spawn(runAutoSnipe) end,
+        -- Route Manual TP through the SAME SXE engine that TP-on-load uses (which
+        -- works). The old runAutoSnipe path falls back to the broken legacy TP when
+        -- GrabbleTP is off, and it ran CONCURRENTLY with the hardcoded T->doVelocityTP
+        -- listener, so two TP systems fought over the character and it broke.
+        ["Manual TP"]=function()
+            if _G.SXE_ExecuteManualTP then _G.SXE_ExecuteManualTP()
+            elseif _G.SXEStartSideTP then task.spawn(_G.SXEStartSideTP)
+            else task.spawn(runAutoSnipe) end
+        end,
         ["Auto Buy"]=function() toggleAutoBuy() end,
         ["Click to AP"]=function()
             Config.ClickToAP = not Config.ClickToAP
@@ -9514,83 +10508,74 @@ UIS.InputBegan:Connect(function(input,gp) if gp then return end; if input.UserIn
 end)
 
 
--- AUTO-EXECUTE FROM CONFIG (Robust Retry Loop)
 if Config.TpSettings.TpOnLoad then task.spawn(function()
     local char = player.Character or player.CharacterAdded:Wait()
     char:WaitForChild("HumanoidRootPart", 20)
     char:WaitForChild("Humanoid", 20)
-    
-    local t = 0
-    while (not SharedState.InitialScanComplete or #SharedState.AllAnimalsCache == 0) and t < 150 do
-        task.wait(0.1)
-        t = t + 1
+    -- RACE FIX: _G.SXEStartSideTP is assigned ~1800 lines below this block. If
+    -- the character already exists when this task runs (it usually spawns DURING
+    -- loading), the old plain `if` saw nil and the TP silently never fired.
+    -- Wait for the engine to finish defining it instead of a blind 0.1s.
+    local _t0 = os.clock()
+    while not _G.SXEStartSideTP and os.clock() - _t0 < 10 do
+        RunService.Heartbeat:Wait()
     end
-    task.wait(0.15) -- Extreme optimized network sync wait
-    
-    local minGen = parseMinGen(Config.TpSettings.MinGenForTp)
-    local success = false
-    local attempts = 0
-    while not success and attempts < 30 do
-        attempts = attempts + 1
-        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character:FindFirstChild("Humanoid") and player.Character.Humanoid.Health > 0 then
-            local targetPetData = getTargetPetData()
-            
-            if targetPetData then
-                local targetPart = findAdorneeGlobal(targetPetData)
-                if targetPart then
-                    task.spawn(runAutoSnipe)
-                    success = true
-                    break
-                end
-            end
-        end
-        task.wait(0.5)
+    -- make sure nothing left the character anchored before we try to move
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then pcall(function() hrp.Anchored = false end) end
+    if _G.SXEStartSideTP then
+        if _G.__LMARK then _G.__LMARK("TP-on-load fired") end
+        _G.SXEStartSideTP()
     end
 end) end
 
-task.spawn(function() task.wait(0.5)
-    -- Desync removed from startup
-    if Config.ClickToAP then Config.ClickToAP = false end
+task.spawn(function()
+    -- Instant: things needed for TP to work immediately
+    task.wait(0.1)
+    -- (Removed: Config.ClickToAP = false -- it re-disabled Click-to-AP ~0.1s
+    -- after load, so it only worked after a manual off/on toggle.)
     if Config.AntiRagdoll then startAntiRagdoll() end
     if Config.InfiniteJump then setInfiniteJump(true) end
-    if Config.Float then setFloat(true) end
-    if Config.Unwalk then setUnwalk(true) end
-
-    if Config.AutoCloseOnExec then if main then main.Visible = false end end
-    if Config.FPSBoost then setFPSBoost(true) end
-    if Config.FPSBoostUltra then setFPSBoostUltra(true) end
-    if Config.XRay then setXRay(true) end
-    pcall(function() Workspace.CurrentCamera.FieldOfView = Config.FOV or 70 end)
-    if Config.PlayerESP then playerESPEnabled=true end
-    if Config.TimerESP then timerESPEnabled=true end
-    if Config.SubspaceMineESP then subspaceMineESPEnabled=true end
-    -- RemoteSell is initialized inside the lazy UI thread (at the top of the file)
-    _G.initRemoteSellLazy = function()
-        if Config.RemoteSellEnabled and _G.toggleRemoteSell then
-            _G.toggleRemoteSell(true)
-        end
-    end
-    if Config.ProximityAP then setProximityAP(true) end
-    if Config.AutoBuyEnabled then toggleAutoBuy(true) end
     if Config.StealHighest then setStealMode("Highest")
     elseif Config.StealPriority then setStealMode("Priority")
     elseif Config.StealNearest then setStealMode("Nearest")
     else setStealMode("Highest") end
-    if updateMovementPanelLabels then updateMovementPanelLabels() end
+
+    -- Delayed: UI and non-essential features
+    task.spawn(function()
+        task.wait(3)
+        if Config.Float then setFloat(true) end
+        if Config.Unwalk then setUnwalk(true) end
+        if Config.AutoCloseOnExec then if main then main.Visible = false end end
+        if Config.FPSBoost then setFPSBoost(true) end
+        if Config.FPSBoostUltra then setFPSBoostUltra(true) end
+        if Config.XRay then setXRay(true) end
+        pcall(function() Workspace.CurrentCamera.FieldOfView = Config.FOV or 70 end)
+        if Config.PlayerESP then playerESPEnabled=true end
+        if Config.TimerESP then timerESPEnabled=true end
+        if Config.SubspaceMineESP then subspaceMineESPEnabled=true end
+        _G.initRemoteSellLazy = function()
+            if Config.RemoteSellEnabled and _G.toggleRemoteSell then
+                _G.toggleRemoteSell(true)
+            end
+        end
+        if Config.ProximityAP then setProximityAP(true) end
+        if Config.AutoBuyEnabled then toggleAutoBuy(true) end
+        if updateMovementPanelLabels then updateMovementPanelLabels() end
+    end)
 end)
 
 _G.InvisStealAngle=Config.InvisStealAngle or 225; _G.SinkSliderValue=Config.SinkSliderValue or 7
 _G.AutoRecoverLagback=true; _G.AutoInvisDuringSteal=Config.AutoInvisDuringSteal or false
 
-print("SXE HUB PRIVAT loaded ")
+print("Hub loaded")
+if _G.__LMARK then _G.__LMARK("hub main body done") end
 
 
-task.spawn(function()
-    while true do
-        task.wait(15)
-        pcall(collectgarbage, "collect")
-    end
-end)
+-- REMOVED: a forced collectgarbage("collect") every 15s. That's a full
+-- stop-the-world GC = a hard freeze on a 50-60MB heap. Luau's automatic GC is
+-- incremental (spreads collection across frames), so leaving it alone gives many
+-- tiny pauses instead of one big periodic freeze.
 
 
 
@@ -9620,7 +10605,7 @@ end
 local lastNoclipUpdate = 0
 RunService.Stepped:Connect(function()
     local now = tick()
-    if now - lastNoclipUpdate < 0.1 then return end
+    if now - lastNoclipUpdate < 0.3 then return end
     lastNoclipUpdate = now
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer and p.Character then
@@ -9632,15 +10617,133 @@ RunService.Stepped:Connect(function()
         end
     end
 end)
-local SXE_AC = {} 
-end 
-   end
-
+-- ============================================================
+-- TP PRELOADER
+-- ============================================================
 task.spawn(function()
-    task.wait(0.15)
-    pcall(applyTheme, "Dark")
+    local _lp = LP or Players.LocalPlayer
+    if not _lp then return end
+    local char = _lp.Character or _lp.CharacterAdded:Wait()
+    if not char then return end
+    char:WaitForChild("HumanoidRootPart", 10)
+    char:WaitForChild("Humanoid", 10)
+    task.wait(0.1)
+
+    pcall(function()
+        local Packages = RS:WaitForChild("Packages", 5)
+        local Datas = RS:WaitForChild("Datas", 5)
+        local Utils = RS:WaitForChild("Utils", 5)
+        if Packages then
+            require(Packages:WaitForChild("Synchronizer"))
+            require(Packages:WaitForChild("Net"))
+        end
+        if Datas then
+            require(Datas:WaitForChild("Animals"))
+            require(Datas:WaitForChild("Mutations"))
+            require(Datas:WaitForChild("Traits"))
+        end
+        if Utils then
+            require(Utils:WaitForChild("NumberUtils"))
+        end
+    end)
+
+    pcall(function()
+        if _G.Net then
+            local _ = (_G.Net.GetRemote and _G.Net:GetRemote("UseItem")) or _G.Net:RemoteEvent("UseItem")
+        end
+    end)
+
+    pcall(function()
+        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local path = game:GetService("PathfindingService"):CreatePath({
+                AgentRadius = 16, AgentHeight = 5,
+                AgentCanJump = true, AgentJumpHeight = 10, AgentMaxSlope = 89,
+            })
+            local pos = hrp.Position
+            pcall(function()
+                path:ComputeAsync(pos, pos + Vector3.new(5, 0, 5))
+            end)
+        end
+    end)
+
+    pcall(function()
+        local Plots = workspace:FindFirstChild("Plots")
+        if not Plots then return end
+        for _, plot in ipairs(Plots:GetChildren()) do
+            task.spawn(function()
+                local ch = _G.SXE_GetPlotChannel and _G.SXE_GetPlotChannel(plot.Name)
+                if ch then
+                    pcall(function() _G.sProp(ch, "AnimalList") end)
+                    pcall(function() _G.sProp(ch, "Owner") end)
+                end
+            end)
+            task.wait(0.02)
+        end
+    end)
+
+    pcall(function()
+        local Plots = workspace:FindFirstChild("Plots")
+        if not Plots then return end
+        for _, plot in ipairs(Plots:GetChildren()) do
+            local podiums = plot:FindFirstChild("AnimalPodiums")
+            if podiums then
+                for _, podium in ipairs(podiums:GetChildren()) do
+                    local base = podium:FindFirstChild("Base")
+                    local spawn = base and base:FindFirstChild("Spawn")
+                    local attach = spawn and spawn:FindFirstChild("PromptAttachment")
+                    if attach then
+                        for _, p in ipairs(attach:GetChildren()) do
+                            if p:IsA("ProximityPrompt") then
+                                task.spawn(function()
+                                    pcall(buildStealCallbacks, p)
+                                end)
+                            end
+                        end
+                    end
+                    task.wait(0.01)
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        local bp = LP:FindFirstChild("Backpack")
+        if not bp then return end
+        for _, tool in ipairs(bp:GetChildren()) do
+            local _ = tool.Name
+        end
+    end)
+
+    pcall(function()
+        local result = _G.XenSyncAll and _G.XenSyncAll()
+        if result then
+            for k, v in pairs(result) do
+                pcall(function()
+                    if type(v) == "table" then
+                        _G.sProp(v, "AnimalList")
+                    end
+                end)
+            end
+        end
+    end)
+
+    pcall(function()
+        local t0 = os.clock()
+        while #SharedState.AllAnimalsCache == 0 and (os.clock() - t0) < 3 do
+            task.wait(0.1)
+        end
+        if #SharedState.AllAnimalsCache > 0 then
+            pcall(getTargetPetData)
+        end
+    end)
+
+    print("[SXE] TP Preload complete")
 end)
 
+local SXE_AC = {}
+end
+   end
 
 -- ============================================================
 -- SXE AUTO-STEAL + CLONE-TP ENGINE (integrated) -- xentp.lua 1:1 port
@@ -9664,7 +10767,7 @@ do
             local Utils = RS:WaitForChild("Utils", 5)
             Synchronizer = require(Packages:WaitForChild("Synchronizer"))
             AnimalsData = require(Datas:WaitForChild("Animals"))
-            AnimalsShared = require(Shared:WaitForChild("Animals"))
+            AnimalsShared = _G._xenAnimShim
             NumberUtils = require(Utils:WaitForChild("NumberUtils"))
         end)
         return ok and Synchronizer ~= nil
@@ -9674,16 +10777,17 @@ do
     local function loadNet()
         if NetModule then return true end
         local ok, mod = pcall(function()
-            return require(RS:WaitForChild("Packages", 5):WaitForChild("Net", 5):FindFirstChildWhichIsA("ModuleScript", true))
+            return _G.Net
         end)
-        if not ok or type(mod) ~= "table" then return false end
+        if not ok or type(mod) ~= "table" then
+            warn("[SXE AutoSteal] loadNet FAILED - _G.Net not available. ok=" .. tostring(ok) .. " type=" .. type(mod))
+            return false
+        end
         NetModule = mod
         return true
     end
 
     local function fireGrapple()
-        if not NetModule then loadNet() end
-        if not NetModule then return end
         local char = LP.Character
         if not char then return end
         if not char:FindFirstChild("Grapple Hook") then
@@ -9693,7 +10797,12 @@ do
             if tool and hum then pcall(function() hum:EquipTool(tool) end) end
         end
         if not char:FindFirstChild("Grapple Hook") then return end
-        pcall(function() NetModule:RemoteEvent("UseItem"):FireServer(2) end)
+        -- Fire the live hashed RE/UseItem with a far-grapple float (resolver
+        -- tracks the per-join hash rotation; old GetRemote returned the dead
+        -- plaintext alias, which is why this stopped working after the update).
+        if not (_G.SXEFireGrapple2 and _G.SXEFireGrapple2()) then
+            warn("[SXE] fireGrapple: UseItem remote not resolved")
+        end
     end
     _G.SXEFireGrapple = fireGrapple
 
@@ -9741,28 +10850,54 @@ do
         end
         return nil
     end
-    local function carpetEngage()
+local function carpetEngage()
         if not NetModule then pcall(loadNet) end
-        local _t0 = os.clock()
-        while not findTool("Grapple Hook") and os.clock() - _t0 < 5 do
-            if not NetModule then pcall(loadNet) end
-            RunService.Heartbeat:Wait()
-        end
         local char = LP.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if not char or not hum then return nil end
-        if not char:FindFirstChild("Grapple Hook") then
-            local g = findTool("Grapple Hook")
-            if g then pcall(function() hum:EquipTool(g) end) end
+        -- Wait up to 3s for the grapple to replicate into backpack/character AND
+        -- for _G.Net to come online. (Was 1s -- too short on a fresh join, so the
+        -- very first TP silently skipped the grapple fire.)
+        local _t0 = os.clock()
+        while not findTool("Grapple Hook") and os.clock() - _t0 < 3 do
+            if not NetModule then pcall(loadNet) end
+            RunService.Heartbeat:Wait()
+        end
+        local g = findTool("Grapple Hook")
+        if g and g.Parent ~= char then
+            pcall(function() hum:EquipTool(g) end)
+            -- Wait until the equip actually registers (tool becomes a child of the
+            -- character) instead of a fixed 0.05s that lost the race on start.
+            local _te = os.clock()
+            while not (LP.Character and LP.Character:FindFirstChild("Grapple Hook"))
+                  and os.clock() - _te < 0.5 do
+                RunService.Heartbeat:Wait()
+            end
+        end
+        if LP.Character and LP.Character:FindFirstChild("Grapple Hook") then
+            -- Fire the live hashed RE/UseItem with a far-grapple float. The
+            -- resolver tracks the per-join hash rotation, so this works on every
+            -- join with no hooks and no manual learning.
+            if not (_G.SXEFireGrapple2 and _G.SXEFireGrapple2()) then
+                warn("[SXE] carpetEngage: could not resolve UseItem remote")
+            end
+        else
+            -- Diagnostic: say exactly WHY, so a load-time failure is identifiable
+            -- instead of ambiguous (tool missing vs. equip race vs. no remote).
+            local _bp = LP:FindFirstChild("Backpack")
+            local _names = {}
+            if _bp then for _, t in ipairs(_bp:GetChildren()) do _names[#_names+1] = t.Name end end
+            warn(("[SXE] carpetEngage: grapple skipped -- inBackpack=%s inChar=%s remote=%s | backpack: %s")
+                :format(
+                    tostring(_bp ~= nil and _bp:FindFirstChild("Grapple Hook") ~= nil),
+                    tostring(LP.Character ~= nil and LP.Character:FindFirstChild("Grapple Hook") ~= nil),
+                    tostring(_G.SXEGrappleReady and _G.SXEGrappleReady() or false),
+                    (#_names > 0 and table.concat(_names, ", ") or "(empty)")))
         end
         task.wait(0.08)
-        if NetModule and LP.Character and LP.Character:FindFirstChild("Grapple Hook") then
-            pcall(function() NetModule:RemoteEvent("UseItem"):FireServer(2) end)
-        end
-        task.wait(0.15)
         local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         if h then pcall(function() h:UnequipTools() end) end
-        task.wait(0.15)
+        task.wait(0.08)
         local cn
         local _tc = os.clock()
         repeat
@@ -9873,50 +11008,82 @@ do
     local function getPlotChannel(plotName)
         if not Synchronizer then return nil end
         local channel
-        pcall(function() channel = Synchronizer:Get(plotName) end)
-        if not channel then pcall(function() channel = Synchronizer:Wait(plotName) end) end
+        pcall(function() channel = _G.SXE_GetPlotChannel(plotName) end)
+        if not channel then local _t0=os.clock() repeat channel=_G.XenSyncGet(plotName) if channel then break end task.wait(0.05) until os.clock()-_t0>3 end
         return channel
     end
     local function channelGet(channel, key)
         if not channel then return nil end
         local v
+        -- Read the cached table directly (rawget) FIRST -- far lighter than the
+        -- channel:Get() Synchronizer method call, which ran per plot on every scan
+        -- (up to 10x/s) and was a major pre-TP FPS drain. Only fall back to the
+        -- method call if the cache genuinely doesn't have the key.
+        pcall(function()
+            local ct = rawget(channel, "CacheTable")
+            if type(ct) == "table" then v = ct[key] end
+        end)
+        if v ~= nil then return v end
         pcall(function() if type(channel.Get) == "function" then v = channel:Get(key) end end)
-        if v == nil then pcall(function() v = channel.CacheTable and channel.CacheTable[key] end) end
         return v
     end
+    -- Resolve a channel Owner value (Player instance / UserId number / username
+    -- string / table) to a Player. The game update switched Owner to a USERNAME
+    -- STRING, which neither isMyPlot nor ownerInGame handled -- ownerInGame then
+    -- returned false for every plot, so the scanner skipped them all and found
+    -- zero pets. Handles every known shape so a future change can't break it.
+    local function resolveOwner(owner)
+        if owner == nil then return nil end
+        local plr
+        pcall(function()
+            if typeof(owner) == "Instance" then
+                plr = owner:IsA("Player") and owner or Players:FindFirstChild(owner.Name)
+            elseif type(owner) == "number" then
+                plr = Players:GetPlayerByUserId(owner)
+            elseif type(owner) == "string" then
+                if tonumber(owner) then plr = Players:GetPlayerByUserId(tonumber(owner)) end
+                if not plr then
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p.Name:lower() == owner:lower() or p.DisplayName:lower() == owner:lower() then
+                            plr = p; break
+                        end
+                    end
+                end
+            elseif type(owner) == "table" then
+                if owner.UserId then plr = Players:GetPlayerByUserId(owner.UserId) end
+                if not plr and owner.Name then plr = Players:FindFirstChild(tostring(owner.Name)) end
+            end
+        end)
+        return plr
+    end
+
     local function isMyPlot(channel)
         if not channel then return false end
         local owner = channelGet(channel, "Owner")
         if not owner then return false end
-        local result = false
-        pcall(function()
-            if typeof(owner) == "Instance" and owner:IsA("Player") then
-                result = owner.UserId == LP.UserId
-            elseif type(owner) == "table" and owner.UserId then
-                result = owner.UserId == LP.UserId
-            elseif typeof(owner) == "Instance" then
-                result = owner == LP
-            end
-        end)
-        return result
+        local plr = resolveOwner(owner)
+        if plr then return plr.UserId == LP.UserId end
+        -- Unresolved string: compare names directly (owner may have left, etc.)
+        if type(owner) == "string" then
+            local o = owner:lower()
+            return o == LP.Name:lower() or o == LP.DisplayName:lower()
+        end
+        return false
     end
+
     local function ownerInGame(channel)
         if not channel then return false end
         local owner = channelGet(channel, "Owner")
         if not owner then return false end
-        local inGame = false
-        pcall(function()
-            if typeof(owner) == "Instance" and owner:IsA("Player") then
-                inGame = Players:FindFirstChild(owner.Name) ~= nil
-            elseif type(owner) == "number" then
-                inGame = Players:GetPlayerByUserId(owner) ~= nil
-            elseif type(owner) == "table" and owner.Name then
-                inGame = Players:FindFirstChild(tostring(owner.Name)) ~= nil
-            elseif typeof(owner) == "Instance" and owner.Name then
-                inGame = Players:FindFirstChild(owner.Name) ~= nil
-            end
-        end)
-        return inGame
+        if resolveOwner(owner) then return true end
+        -- FAIL OPEN: if the Owner is a shape we can't resolve, do NOT skip the
+        -- plot. Skipping on an unknown format is what made the whole scan return
+        -- nothing; including it at worst adds a plot whose owner already left.
+        if typeof(owner) == "Instance" or type(owner) == "number"
+           or (type(owner) == "table" and (owner.UserId or owner.Name)) then
+            return false   -- known shape, genuinely not in game
+        end
+        return true
     end
     local function isPlotUnlocked(plotName)
         local ok, res = pcall(function()
@@ -9929,25 +11096,38 @@ do
 
     -- ===== Pet position =====
     local function getPetPosition(plot, slot)
-        local podiums = plot:FindFirstChild("AnimalPodiums")
-        if not podiums then return nil end
-        local podium = podiums:FindFirstChild(tostring(slot))
-        if not podium then return nil end
-        for _, desc in ipairs(podium:GetDescendants()) do
-            if desc:IsA("Model") and desc.Name ~= "Claim" and desc.Name ~= "Base" and desc.Name ~= "Decorations" then
-                local hasMesh = false
-                for _, c in ipairs(desc:GetDescendants()) do
-                    if c:IsA("MeshPart") then hasMesh = true; break end
-                end
-                if hasMesh then
-                    local ok, cf = pcall(function() return desc:GetBoundingBox() end)
-                    if ok then return cf.Position end
+        -- 5s position cache (shared _G.__PetPosCache): podium pets don't move, so
+        -- this skips the heavy GetDescendants + GetBoundingBox on every scan.
+        _G.__PetPosCache = _G.__PetPosCache or {}
+        local _cache = _G.__PetPosCache
+        local _key = plot.Name .. "|" .. tostring(slot)
+        local _hit = _cache[_key]
+        local _now = os.clock()
+        if _hit and _now < _hit.exp then return _hit.pos end
+        local function compute()
+            local podiums = plot:FindFirstChild("AnimalPodiums")
+            if not podiums then return nil end
+            local podium = podiums:FindFirstChild(tostring(slot))
+            if not podium then return nil end
+            for _, desc in ipairs(podium:GetDescendants()) do
+                if desc:IsA("Model") and desc.Name ~= "Claim" and desc.Name ~= "Base" and desc.Name ~= "Decorations" then
+                    local hasMesh = false
+                    for _, c in ipairs(desc:GetDescendants()) do
+                        if c:IsA("MeshPart") then hasMesh = true; break end
+                    end
+                    if hasMesh then
+                        local ok, cf = pcall(function() return desc:GetBoundingBox() end)
+                        if ok then return cf.Position end
+                    end
                 end
             end
+            local ok, cf = pcall(function() return podium:GetPivot() end)
+            if ok then return cf.Position end
+            return podium.Position
         end
-        local ok, cf = pcall(function() return podium:GetPivot() end)
-        if ok then return cf.Position end
-        return podium.Position
+        local _pos = compute()
+        if _pos then _cache[_key] = { pos = _pos, exp = _now + 12 + math.random() * 8 } end
+        return _pos
     end
 
     -- ===== Fusing check =====
@@ -10101,12 +11281,37 @@ do
     -- ===== Viz =====
     local _vizParts = {}
     local function clearViz()
+        _G.__vizGen = (_G.__vizGen or 0) + 1
         for _, p in ipairs(_vizParts) do if p and p.Parent then p:Destroy() end end
         table.clear(_vizParts)
     end
     local function vizPath(fromPos, waypoints)
-        -- Pathfinder lines/dots disabled (user request: no lines).
-        return
+        -- Draw the TP route: one-color dots at each waypoint + neon connecting
+        -- lines. Toggle off with _G.SXEShowTPPath = false. Helpers are inlined so
+        -- no new do-block locals are added (Luau 200-register limit).
+        if _G.SXEShowTPPath == false then return end
+        if not fromPos or not waypoints or #waypoints == 0 then return end
+        clearViz()
+        local LINE = Color3.fromRGB(0, 200, 255)   -- cyan connectors
+        local DOT  = Color3.fromRGB(255, 255, 0)    -- all dots one color
+        local function dot(pos)
+            local p = Instance.new("Part")
+            p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CastShadow = false
+            p.Shape = Enum.PartType.Ball; p.Material = Enum.Material.Neon; p.Color = DOT
+            p.Size = Vector3.new(1.5, 1.5, 1.5); p.Position = pos; p.Parent = Workspace
+            _vizParts[#_vizParts + 1] = p
+        end
+        local function line(a, b)
+            local d = b - a; if d.Magnitude < 0.05 then return end
+            local p = Instance.new("Part")
+            p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CastShadow = false
+            p.Material = Enum.Material.Neon; p.Color = LINE
+            p.Size = Vector3.new(0.4, 0.4, d.Magnitude); p.CFrame = CFrame.new((a + b) / 2, b); p.Parent = Workspace
+            _vizParts[#_vizParts + 1] = p
+        end
+        dot(fromPos)
+        local prev = fromPos
+        for _, wp in ipairs(waypoints) do line(prev, wp); dot(wp); prev = wp end
     end
 
     -- ===== Movement =====
@@ -10122,6 +11327,7 @@ do
         if not hrp or not hrp.Parent or #waypoints == 0 then return end
         local _runSpeed = speedOverride or SXESpeed.CARPET
         vizPath(hrp.Position, waypoints)
+        local _myVizGen = _G.__vizGen
         local wpIdx = 1
         local done = false
         local conn
@@ -10135,7 +11341,11 @@ do
                 hrp.CFrame = CFrame.new(waypoints[#waypoints]) * CFrame.Angles(0, y, 0)
             end
             if conn then conn:Disconnect() end
-            clearViz()
+            -- Linger briefly after arrival so the path is visible on fast TPs;
+            -- only clear if a newer path hasn't replaced it.
+            task.delay(tonumber(_G.SXETPPathLinger) or 1.5, function()
+                if _G.__vizGen == _myVizGen then clearViz() end
+            end)
         end
         local lastDist, stall = math.huge, 0
         if quickStart then
@@ -10340,22 +11550,25 @@ do
 
     -- ===== Clone / goToBrainrot =====
     local function doClone()
-        if not NetModule then pcall(loadNet) end
         local char = LP.Character or LP.CharacterAdded:Wait()
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if not char or not hum then return false end
         local cloner = (LP:FindFirstChild("Backpack") and LP.Backpack:FindFirstChild("Quantum Cloner"))
                     or char:FindFirstChild("Quantum Cloner")
-        if not cloner then return false end
-        if cloner.Parent ~= char then
-            pcall(function() hum:EquipTool(cloner) end)
-            task.wait()
+        if not cloner then
+            warn("[SXE] doClone: Quantum Cloner not found in Backpack or Character")
+            return false
         end
-        if not NetModule then return false end
-        local useOk = pcall(function() NetModule:RemoteEvent("UseItem"):FireServer() end)
-        task.wait(0.05)
-        local telOk = pcall(function() NetModule:RemoteEvent("QuantumCloner/OnTeleport"):FireServer() end)
-        return useOk and telOk
+        -- Use the EXACT manual-clone method: equip the cloner, Activate() it, then
+        -- firesignal the game's own TeleportToClone button so the GAME performs the
+        -- switch through its legitimate code path. Firing QuantumCloner/OnTeleport
+        -- directly stopped switching after the update -- this doesn't.
+        if _G.SXEInstantClone then
+            _G.SXEInstantClone()
+            return true
+        end
+        warn("[SXE] doClone: manual clone method (_G.SXEInstantClone) unavailable")
+        return false
     end
 
     -- CARPET GLIDE: fly straight to the pet on the equipped carpet at FULL 3D speed
@@ -10447,10 +11660,32 @@ do
         local h = petPos.Y
         local targetY = hrp.Position.Y
         if h > 23.15 then targetY = 21
-        elseif h >= 11 and h <= 23.15 then targetY = 14.5
+        elseif h >= 11 and h <= 23.15 then
+            -- V3 Floor 2 from Floor 1: use the runAutoSnipe F3-from-F2 pattern
+            -- literally — character ends up at petY - 8 (8 studs below the pet)
+            -- and the platform below settles at petY - 11 (3 studs below the
+            -- character). Same relative offsets the F3 case uses, just applied
+            -- to the F2 pet Y.
+            targetY = (Config.AutoTPFloor2FromFloor1 and (h - 8)) or 14.5
         elseif h >= -6.9 and h <= 8.9 then targetY = -4 end
         local _to = Vector3.new(petPos.X, targetY, petPos.Z)
-        if Config.TpSettings and Config.TpSettings.BrainrotCarpet then
+        -- V3 Floor 2 from Floor 1: after the clone lands us inside the base on
+        -- floor 1, spam Humanoid.Jump so we bounce up toward the 2nd floor pet
+        -- instead of moving to under it with a lerp+platform.
+        local _isF2FromF1Case = Config.AutoTPFloor2FromFloor1 and h >= 11 and h <= 23.15
+        if _isF2FromF1Case then
+            task.spawn(function()
+                local start = tick()
+                while (tick() - start) < 8 do
+                    if LP:GetAttribute("Stealing") then break end
+                    if hum and hum.Parent then
+                        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                        pcall(function() hum.Jump = true end)
+                    end
+                    task.wait(0.1)
+                end
+            end)
+        elseif Config.TpSettings and Config.TpSettings.BrainrotCarpet then
             -- Carpet to Brainrot: after the clone/grabble TP into the base, glide on
             -- the carpet straight to the pet (uses live Walk To Brainrot Speed).
             carpetGlideTo(petPos)
@@ -10459,26 +11694,28 @@ do
             if not _route or #_route == 0 then _route = { _to } end
             velMoveThrough(hrp, _route, (Config and Config.TpSettings and (tonumber(Config.TpSettings.WalkTPSpeed) or tonumber(Config.TpSettings.GrabbleTPSpeed))) or SXESpeed.INBASE, true, true)
         end
-        if hrp and hrp.Parent then
+        if hrp and hrp.Parent and not _isF2FromF1Case then
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.AssemblyAngularVelocity = Vector3.zero
         end
-        do
-            local _platPos = (hrp and hrp.Parent and hrp.Position) or _to
-            local _feetY = _platPos.Y - 3
-            local _plat = Instance.new("Part")
-            _plat.Name = "SXETempPlatform"; _plat.Size = Vector3.new(8, 1, 8)
-            _plat.Position = Vector3.new(petPos.X, _feetY - 1.5, petPos.Z)
-            _plat.Anchored = true; _plat.CanCollide = false; pcall(makeOneWay, _plat); _plat.Transparency = 1
-            _plat.Material = Enum.Material.SmoothPlastic; _plat.Parent = workspace
-            task.spawn(function()
-                local _s = tick()
-                while tick() - _s < 20 do
-                    if LP:GetAttribute("Stealing") then break end
-                    task.wait(0.1)
-                end
-                if _plat and _plat.Parent then _plat:Destroy() end
-            end)
+        if not _isF2FromF1Case then
+            do
+                local _platPos = (hrp and hrp.Parent and hrp.Position) or _to
+                local _feetY = _platPos.Y - 3
+                local _plat = Instance.new("Part")
+                _plat.Name = "SXETempPlatform"; _plat.Size = Vector3.new(8, 1, 8)
+                _plat.Position = Vector3.new(petPos.X, _feetY - 1.5, petPos.Z)
+                _plat.Anchored = true; _plat.CanCollide = false; pcall(makeOneWay, _plat); _plat.Transparency = 1
+                _plat.Material = Enum.Material.SmoothPlastic; _plat.Parent = workspace
+                task.spawn(function()
+                    local _s = tick()
+                    while tick() - _s < 20 do
+                        if LP:GetAttribute("Stealing") then break end
+                        task.wait(0.1)
+                    end
+                    if _plat and _plat.Parent then _plat:Destroy() end
+                end)
+            end
         end
     end
 
@@ -10511,13 +11748,23 @@ do
     local function executeStealAsync(prompt)
         local data = InternalStealCache[prompt]
         if not data or not data.ready then return false end
+        -- Global guard: never start a second hold while one is already running.
+        -- Without this, a mid-hold target switch (or a different prompt object
+        -- for the same pet) starts an overlapping hold, so the game's progress
+        -- bar restarts (50% -> 50% -> 10% -> 100%). Intermittent because it only
+        -- triggers when the best target flips during the ~1.3s hold window.
+        -- The staleness check is a safety valve: if a previous hold somehow
+        -- never reset the flag, allow a fresh one instead of deadlocking steals.
+        if _stealHoldActive and (tick() - _stealHoldStart) < (STEAL_HOLD_DURATION + 1) then
+            return false
+        end
         data.ready = false
         _stealHoldStart = tick()
         _stealHoldActive = true
         _G.SXE_StealStatus = _G.SXE_StealStatus or {}
         _G.SXE_StealStatus.active = true
         _G.SXE_StealStatus.start = _stealHoldStart
-        _G.SXE_StealStatus.duration = STEAL_HOLD_DURATION
+        _G.SXE_StealStatus.duration = tonumber(_G.SXEStealHoldDuration) or STEAL_HOLD_DURATION
 
         task.spawn(function()
             for _, fn in ipairs(data.holdCallbacks) do task.spawn(fn) end
@@ -10525,8 +11772,8 @@ do
                 local _st = prompt:GetAttribute("State")
                 if _st ~= nil and _st ~= "Steal" then
                     if not _G._xenStealRemote then
-                        local _net = _G.XenNet or require(game:GetService("ReplicatedStorage"):WaitForChild("Packages"):WaitForChild("Net"):FindFirstChildWhichIsA("ModuleScript", true))
-                        _G._xenStealRemote = _net and _net:RemoteEvent("f40f7d9e-2f0d-4167-b250-899273f46874")
+                        local _net = _G.Net
+                        _G._xenStealRemote = _net and ((_net.GetRemote and _net:GetRemote("f40f7d9e-2f0d-4167-b250-899273f46874")) or _net:RemoteEvent("f40f7d9e-2f0d-4167-b250-899273f46874"))
                     end
                     local r = _G._xenStealRemote
                     if r then
@@ -10536,7 +11783,13 @@ do
                     end
                 end
             end)
-            local remain = STEAL_HOLD_DURATION - (tick() - _stealHoldStart)
+            -- Effective hold before firing the trigger that completes the steal.
+            -- Live-tunable via _G.SXEStealHoldDuration: set it to e.g. 0.1 to steal
+            -- ~every 0.1s (default 1.3 = the game's normal steal timing). Kept
+            -- separate from STEAL_HOLD_DURATION so the guard/threshold logic is
+            -- unaffected. Lower = faster but FAR more detectable by anti-cheat.
+            local _holdDur = tonumber(_G.SXEStealHoldDuration) or STEAL_HOLD_DURATION
+            local remain = _holdDur - (tick() - _stealHoldStart)
             if remain > 0 then task.wait(remain) end
             if prompt and prompt.Parent then
                 for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
@@ -10770,8 +12023,10 @@ do
         local allPets = scanAllPets()
         if #allPets == 0 then
             local _t0 = os.clock()
-            while #allPets == 0 and os.clock() - _t0 < 4 do
-                task.wait(0.15)
+            -- Poll fast so TP-on-load fires the instant the first plot replicates
+            -- (was 0.15s -> up to 0.15s of dead wait per cycle on join).
+            while #allPets == 0 and os.clock() - _t0 < 6 do
+                task.wait(0.05)
                 allPets = scanAllPets()
             end
         end
@@ -10794,7 +12049,17 @@ do
 
         local adjY = petPos.Y
         if TALL_PETS[petName] then adjY = petPos.Y - TALL_OFFSET end
+        -- V3 Floor 2 from Floor 1: when the pet is on floor 2 and the toggle is on,
+        -- clamp adjY down so coordTable picks LOWER (floor-1 wall) instead of UPPER,
+        -- and the FIRST FLOOR branch below (walk-in via pathfinder) is preferred.
+        local _f2FromF1 = Config.AutoTPFloor2FromFloor1 and petPos.Y > 10 and petPos.Y <= 25
+        if _f2FromF1 then adjY = math.min(adjY, UPPER_Y_THRESHOLD) end
         local coordTable = adjY > UPPER_Y_THRESHOLD and UPPER or LOWER
+
+        -- Fire the grapple THE INSTANT the scan resolves a target -- equips the
+        -- Grapple Hook and fires it immediately so the pull starts right away
+        -- instead of waiting for the movement setup below.
+        pcall(function() if fireGrapple then fireGrapple() end end)
 
         -- CONVEYOR
         if pet.conveyor then
@@ -10804,9 +12069,9 @@ do
             local healConn = RunService.Heartbeat:Connect(function()
                 if hum and hum.Parent then hum.Health = maxHP end
             end)
-            carpetEngage()
-            vZero(hrp)
-            local function livePos()
+        carpetEngage()
+        vZero(hrp)
+        local function livePos()
                 if not model or not model.Parent then return nil end
                 local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
                 return part and part.Position or nil
@@ -10831,16 +12096,21 @@ do
             return
         end
 
-        -- FIRST FLOOR
+        -- FIRST FLOOR: pathfinder walks the player straight in via the front door.
+        -- V3 Floor 2 from Floor 1 is intentionally NOT routed here — it always goes
+        -- through the SKY CLONE-TP branch below so the clone anchors the character
+        -- and goToBrainrot's CFrame lerp reliably places you under the pet with a
+        -- platform (same pattern the F3-from-F2 case uses).
         if petPos.Y <= 8.9 and isPlotUnlocked(pet.plot) then
             local maxHP = hum.MaxHealth
             hum.Health = maxHP
             local healConn = RunService.Heartbeat:Connect(function()
                 if hum and hum.Parent then hum.Health = maxHP end
             end)
-            carpetEngage()
-            vZero(hrp)
-            local _to = Vector3.new(petPos.X, -4, petPos.Z)
+        carpetEngage()
+        vZero(hrp)
+
+        local _to = Vector3.new(petPos.X, -4, petPos.Z)
             local _faceDir
             do
                 local idx = getClosestBaseIdx(petPos)
@@ -10853,6 +12123,22 @@ do
             if hrp and hrp.Parent then
                 hrp.AssemblyLinearVelocity = Vector3.zero
                 hrp.AssemblyAngularVelocity = Vector3.zero
+            end
+            -- V3 Floor 2 from Floor 1 also spams jump on arrival for floor-1
+            -- pets so we grab elevated pets on floor 1 (small platforms, podiums,
+            -- pets sitting slightly above ground level).
+            if Config.AutoTPFloor2FromFloor1 then
+                task.spawn(function()
+                    local start = tick()
+                    while (tick() - start) < 5 do
+                        if LP:GetAttribute("Stealing") then break end
+                        if hum and hum.Parent then
+                            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                            pcall(function() hum.Jump = true end)
+                        end
+                        task.wait(0.1)
+                    end
+                end)
             end
             healConn:Disconnect()
             isTeleporting = false
@@ -10976,7 +12262,9 @@ do
             _ahrp.AssemblyAngularVelocity = Vector3.zero
             pcall(function() _ahrp.Anchored = true end)
             task.delay(1, function()
-                if _ahrp and _ahrp.Parent then pcall(function() _ahrp.Anchored = false end) end
+                if _ahrp and _ahrp.Parent then
+                    pcall(function() _ahrp.Anchored = false end)
+                end
             end)
         end
 
@@ -11009,7 +12297,12 @@ do
                 end
             end
             if _caConn then _caConn:Disconnect() end
-            if _cloneSucceeded then goToBrainrot(petPos) end
+            -- For F2-from-F1 pets, always call goToBrainrot even if the plot-pivot
+            -- proximity check failed. goToBrainrot's anchored CFrame lerp will
+            -- teleport the character to airPos = (petX, petY-8, petZ) regardless
+            -- of where the clone landed, ensuring reliable placement under the pet.
+            local _forceGo = Config.AutoTPFloor2FromFloor1 and petPos.Y > 10 and petPos.Y <= 25
+            if _cloneSucceeded or _forceGo then goToBrainrot(petPos) end
         else
             if _caConn then _caConn:Disconnect() end
         end
@@ -11018,6 +12311,7 @@ do
 
     doGrabbleVelocityTP = doVelocityTP
     _G.SXEStartSideTP = doVelocityTP
+    if _G.__LMARK then _G.__LMARK("engine ready (TP fn defined)") end
 
     _G.SXE_ExecuteManualTP = function()
         task.spawn(function() pcall(doVelocityTP) end)
@@ -11041,8 +12335,8 @@ do
         repeat
             local ok, pets = pcall(scanAllPets)
             if ok and pets and #pets > 0 then break end
-            task.wait(0.3)
-        until os.clock() - _t0 > 12
+            task.wait(0.05)
+        until os.clock() - _t0 > 6
         _started = true
     end)
 end
